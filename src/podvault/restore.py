@@ -2,6 +2,7 @@
 
 import os
 import stat
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -52,6 +53,27 @@ def compare_summary(expected: Dict[str, Any], actual: Dict[str, int]) -> None:
         raise VerificationError("restored tree verification failed: " + "; ".join(differences))
 
 
+def promote_staging(staging: Path, destination: Path) -> None:
+    if destination.is_symlink():
+        raise DestinationConflictError(
+            "destination became a symbolic link during restore: {}".format(destination)
+        )
+    if destination.exists():
+        if not destination.is_dir():
+            raise DestinationConflictError(
+                "destination became a non-directory during restore: {}".format(destination)
+            )
+        try:
+            next(destination.iterdir())
+        except StopIteration:
+            pass
+        else:
+            raise DestinationConflictError(
+                "destination became nonempty during restore: {}".format(destination)
+            )
+    os.replace(str(staging), str(destination))
+
+
 class RestoreService:
     def __init__(
         self,
@@ -71,16 +93,21 @@ class RestoreService:
         identifier: Optional[str],
         destination_value: Optional[str],
         show_progress: bool = True,
+        parallel: int = 32,
+        durable: bool = False,
     ) -> Dict[str, Any]:
+        operation_started = time.monotonic()
         snapshot = select_snapshot(list_snapshots(self.runner, project), identifier)
         root_entry = snapshot.get("rootEntry") or {}
         root_object_id = root_entry.get("obj")
         if not root_object_id:
             raise VerificationError("snapshot does not contain a root object ID")
         self.console.info("Verifying selected snapshot...")
+        verify_started = time.monotonic()
         verification = verify_manifest(
             self.runner, snapshot["id"], 0, show_progress=show_progress
         )
+        verify_seconds = time.monotonic() - verify_started
         configured = self.config.get_project(project)
         default_destination = configured.get("path") if configured else "/workspace/{}".format(project)
         destination = validate_destination(destination_value or default_destination)
@@ -103,6 +130,7 @@ class RestoreService:
         atomic_json_write(marker, state, 0o600)
         self.console.info("Restoring {} into a temporary directory...".format(project))
         try:
+            transfer_started = time.monotonic()
             args = [
                 "--progress" if show_progress else "--no-progress",
                 "snapshot",
@@ -112,34 +140,21 @@ class RestoreService:
                 "--no-overwrite-files",
                 "--no-overwrite-directories",
                 "--no-overwrite-symlinks",
-                "--write-files-atomically",
-                "--flush-files",
+                "--parallel={}".format(parallel),
                 "--no-ignore-permission-errors",
             ]
+            if durable:
+                args.extend(["--write-files-atomically", "--flush-files"])
             if show_progress:
                 self.runner.run_streaming(args)
             else:
                 self.runner.run(args)
+            transfer_seconds = time.monotonic() - transfer_started
+            scan_started = time.monotonic()
             actual = local_tree_summary(staging)
             compare_summary(root_entry.get("summ") or {}, actual)
-            if destination.is_symlink():
-                raise DestinationConflictError(
-                    "destination became a symbolic link during restore: {}".format(destination)
-                )
-            if destination.exists():
-                if not destination.is_dir():
-                    raise DestinationConflictError(
-                        "destination became a non-directory during restore: {}".format(destination)
-                    )
-                try:
-                    next(destination.iterdir())
-                except StopIteration:
-                    pass
-                else:
-                    raise DestinationConflictError(
-                        "destination became nonempty during restore: {}".format(destination)
-                    )
-            os.replace(str(staging), str(destination))
+            scan_seconds = time.monotonic() - scan_started
+            promote_staging(staging, destination)
         except BaseException:
             state["status"] = "interrupted-or-failed"
             state["updated_at"] = utc_now()
@@ -149,15 +164,25 @@ class RestoreService:
             marker.unlink()
         except OSError:
             pass
-        self.config.set_project(project, destination)
+        self.config.set_project(project, destination, engine="kopia")
+        total_seconds = time.monotonic() - operation_started
         receipt = {
             "status": "success",
+            "engine": "kopia",
             "destination": str(destination),
             "podvault_snapshot_id": _tag(snapshot, "podvault.snapshot"),
             "kopia_manifest_id": snapshot["id"],
             "kopia_root_object_id": root_object_id,
             "repository_verification": verification,
             "restored_summary": actual,
+            "restore_parallelism": parallel,
+            "durable_restore": durable,
+            "timings_seconds": {
+                "verification": round(verify_seconds, 3),
+                "transfer": round(transfer_seconds, 3),
+                "tree_scan": round(scan_seconds, 3),
+                "total": round(total_seconds, 3),
+            },
         }
         receipt_path = self.receipts.write(project, "restore", receipt)
         receipt["receipt_path"] = str(receipt_path)

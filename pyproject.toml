@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "podvault"
-version = "0.1.1"
-description = "Safely save and restore ephemeral GPU-pod projects with Kopia"
+version = "0.2.0"
+description = "Save and restore ephemeral GPU-pod projects with Kopia or AzCopy"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
 authors = [{name = "Podvault contributors"}]
-keywords = ["backup", "kopia", "azure", "runpod", "machine-learning"]
+keywords = ["backup", "kopia", "azcopy", "azure", "runpod", "machine-learning"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",

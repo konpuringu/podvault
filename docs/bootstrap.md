@@ -1,78 +1,75 @@
-# Bootstrap on a fresh Linux pod
+# Bootstrap a fresh pod
 
-Podvault deliberately separates installation from backup operations. `save`
-and `restore` never download, install, or update executables.
-
-## Release artifacts
-
-Transfer these trusted release files to the pod:
+Podvault 0.2.0 supports Linux x86-64 and ARM64. Transfer these trusted release
+files to the pod:
 
 ```text
-podvault-0.1.1-py3-none-any.whl
 bootstrap-linux.sh
+podvault-0.2.0-py3-none-any.whl
 ```
 
 They can be downloaded from the public release:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.1.1/bootstrap-linux.sh
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.1.1/podvault-0.1.1-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/bootstrap-linux.sh
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/podvault-0.2.0-py3-none-any.whl
 ```
 
-Then run:
+Review the shell script, then install under `~/.local`:
 
 ```bash
-bash bootstrap-linux.sh podvault-0.1.1-py3-none-any.whl
+bash bootstrap-linux.sh podvault-0.2.0-py3-none-any.whl
 export PATH="$HOME/.local/bin:$PATH"
 podvault --version
 kopia --version
+azcopy --version
 ```
 
-The script supports Linux x86-64 and ARM64. It downloads the pinned Kopia
-0.23.1 release from the official GitHub project, verifies the architecture's
-embedded SHA-256 checksum, installs it under `~/.local/bin`, creates a private
-Python virtual environment, and installs the local Podvault wheel. It does not
-configure credentials or contact Azure.
+The script downloads checksum-pinned Kopia 0.23.1 and AzCopy 10.32.6 release
+archives from their official GitHub projects, verifies the architecture's
+SHA-256 checksum, installs the transfer binaries, and installs Podvault in a
+dedicated virtual environment. It does not use an unversioned latest-download
+URL.
 
-Review the script before execution. It requires `python3`, the Python `venv`
-module, `curl`, `tar`, and `sha256sum`. On a Debian/Ubuntu image where `venv` is
-missing:
-
-```bash
-apt-get update
-apt-get install -y python3-venv curl ca-certificates
-```
+Kopia is needed only for Kopia projects; AzCopy is needed only for AzCopy
+projects. The bootstrap installs both so a fresh pod can discover either engine
+from its remote project record.
 
 ## Manual installation
 
-Install Kopia using its official package instructions or verified release
-archive, make sure `kopia` is on `PATH`, and then install the Podvault wheel in
-an environment of your choice:
+Install Kopia and/or AzCopy using their official verified packages, then install
+the wheel in a virtual environment:
 
 ```bash
 python3 -m venv /opt/podvault-venv
-/opt/podvault-venv/bin/pip install ./podvault-0.1.1-py3-none-any.whl
+/opt/podvault-venv/bin/pip install ./podvault-0.2.0-py3-none-any.whl
 ln -s /opt/podvault-venv/bin/podvault /usr/local/bin/podvault
 
+podvault --version
 kopia --version
-podvault doctor
+azcopy --version
 ```
 
-Podvault requires Kopia 0.23.1 or newer and rejects older versions. Set
-`PODVAULT_KOPIA=/absolute/path/to/kopia` if the executable is intentionally not
-on `PATH`.
+Set `PODVAULT_KOPIA=/absolute/path/to/kopia` or
+`PODVAULT_AZCOPY=/absolute/path/to/azcopy` when a binary is intentionally not on
+`PATH`.
 
-## Secret injection
+## Inject credentials
 
-The repeatable approach is to configure the pod template with environment
-variables sourced from your secret manager:
+AzCopy projects need only the container SAS:
 
-```text
-PODVAULT_AZURE_SAS_URL
-PODVAULT_REPOSITORY_PASSWORD
+```bash
+export PODVAULT_AZURE_SAS_URL='https://ACCOUNT.blob.core.windows.net/CONTAINER?...'
+podvault restore newlm
 ```
 
-Verify that neither value appears in image layers, shell history, startup logs,
-project `.env` files, or notebook output. After injection, `podvault doctor`
-validates the local dependency, SAS shape/expiry, file permissions, and
-repository access without printing either secret.
+Kopia projects also need their original repository password:
+
+```bash
+export PODVAULT_AZURE_SAS_URL='https://ACCOUNT.blob.core.windows.net/CONTAINER?...'
+export PODVAULT_REPOSITORY_PASSWORD='the-original-repository-password'
+podvault restore newlm
+```
+
+Use RunPod Secrets rather than baking credentials into an image or shell
+history. Run `podvault doctor` after credentials are available.

@@ -75,6 +75,11 @@ class ConfigStore:
         value = self.data["projects"].get(name)
         return dict(value) if value else None
 
-    def set_project(self, name: str, path: Path) -> None:
-        self.data["projects"][name] = {"path": str(path)}
+    def set_project(self, name: str, path: Path, engine: Optional[str] = None) -> None:
+        current = self.data["projects"].get(name) or {}
+        value = {"path": str(path)}
+        selected_engine = engine or current.get("engine")
+        if selected_engine:
+            value["engine"] = selected_engine
+        self.data["projects"][name] = value
         self.save()

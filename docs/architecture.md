@@ -1,114 +1,138 @@
-# Architecture and Kopia mapping
+# Architecture and storage formats
 
-Podvault is orchestration around a local Kopia CLI process. There is no Podvault
-server, database, agent, scheduler, or storage format.
+Podvault is local orchestration around either Kopia or AzCopy. It runs no
+server and stores no credentials remotely. A container may hold both formats,
+but each project name is permanently associated with one engine.
 
-## Stable project identity
+## Engine discovery
 
-A real source might be `/workspace/newlm` on one pod and `/mnt/work/newlm` on
-another. Podvault snapshots it using Kopia's source override:
+Podvault writes a small record at:
 
 ```text
-podvault@podvault:/projects/newlm
+.podvault/projects/PROJECT/project.json
 ```
 
-Each manifest also carries these tags:
+It contains the project name, engine, timestamps, and—for AzCopy—the currently
+committed generation. A fresh pod reads this record before choosing a backend.
+Projects created by 0.1 have no record and default to Kopia for compatibility.
+Local and remote engine disagreements are fatal.
+
+The record is written using a minimal standard-library Azure Blob REST client.
+Large transfers are always delegated to Kopia or AzCopy.
+
+## Kopia format
+
+Kopia projects use a stable virtual source:
+
+```text
+podvault@podvault:/projects/PROJECT
+```
+
+Snapshots carry these tags:
 
 ```text
 podvault.schema:1
-podvault.project:newlm
-podvault.snapshot:<random stable UUID>
-podvault.version:<Podvault version>
-podvault.kopia-version:<Kopia version>
-podvault.actual-host:<observed hostname>
-podvault.actual-source:<observed path>
+podvault.project:PROJECT
+podvault.snapshot:RANDOM_STABLE_ID
+podvault.version:PODVAULT_VERSION
+podvault.kopia-version:KOPIA_VERSION
+podvault.actual-host:HOSTNAME
+podvault.actual-source:LOCAL_PATH
 ```
 
 The virtual source and project tag define history. Host and path are diagnostic
-metadata only. The random Podvault snapshot ID remains stable if Kopia rewrites
-a manifest while adding a pin; users may also select the current Kopia manifest
-ID.
+metadata. Kopia owns repository encryption, compression, deduplication,
+content-defined chunking, manifests, and pins.
 
-## Repository connection
+For Azure, Podvault parses a container-scoped SAS and constructs Kopia's
+standard `azureBlob` reconnect token. The token is sent over standard input;
+the repository password is passed in `KOPIA_PASSWORD`. Neither secret is put in
+the Kopia command arguments.
 
-Podvault parses an HTTPS Azure container SAS URL into account, container,
-storage domain, and query token. It constructs Kopia's standard `azureBlob`
-storage configuration in memory and passes a reconnect token to
-`repository create/connect from-config --token-stdin`. The SAS never appears in
-the process argument vector.
+### Kopia save
 
-The non-secret account/container tuple is stored in Podvault config. The SAS and
-repository password come from environment secrets first, then the mode-0600
-credential file, then a hidden interactive prompt. Kopia's connection config is
-also mode 0600 because it contains sensitive connection material.
+1. Validate the source and scan for recently changing files.
+2. Create an incrementally deduplicated, pinned snapshot.
+3. Reject failed entries or a missing manifest/root object.
+4. Run structural repository verification.
+5. Write the success receipt and remote engine record.
 
-## Save transaction
+### Kopia restore
 
-1. Validate a narrow source directory outside Podvault state.
-2. Apply the global policy that recognizes `.podvaultignore`.
-3. Create an incrementally deduplicated, system-pinned Kopia snapshot using the
-   stable virtual source and tags.
-4. Reject a manifest reporting failed entries.
-5. Run `kopia snapshot verify` for structural verification.
-6. Atomically write a success receipt.
-7. Only the CLI result layer may print `SAFE TO TERMINATE: YES`.
+1. Select and structurally verify the requested snapshot.
+2. Validate the destination and create a randomized sibling staging path.
+3. Restore with adaptive parallelism up to 32 and overwrite modes disabled.
+4. Walk the staged tree and compare logical bytes and entry counts.
+5. Rename the staged directory into place and write a receipt.
 
-Any exception after the snapshot starts produces a failure receipt when
-possible. A failed verification never reaches the success output path.
+Normal 0.2 restores intentionally leave Kopia's per-file atomic-write and flush
+options disabled. The entire tree is already isolated until validation and
+promotion. `--durable` enables both slower options for users who explicitly
+need them.
 
-Kopia's final JSON stays on standard output while its CR/LF-delimited progress
-records are streamed through a redacting adapter to standard error. This keeps
-`--json` machine-readable and prevents known SAS/password values from being
-echoed if a diagnostic appears alongside progress. Kopia's estimate evolves as
-the tree is scanned; Podvault does not add a second pre-scan merely to produce a
-fixed denominator.
+## AzCopy format
 
-## Restore transaction
+Every AzCopy save creates a complete immutable generation:
 
-1. Find project manifests by tags and select latest or an explicit stable/current
-   ID.
-2. Structurally verify the chosen manifest.
-3. Create a sibling recovery-state marker.
-4. Ask Kopia to restore the manifest's root object into a randomized sibling
-   directory, with atomic file writes, flushes, and all overwrite modes disabled.
-5. Compare restored regular-file count, symlink count, directory count, and
-   logical size with the signed snapshot summary.
-6. Recheck that the final destination is absent or empty.
-7. Rename the staged directory into place and write a receipt.
+```text
+.podvault/azcopy/v1/projects/PROJECT/snapshots/SNAPSHOT/data/...
+.podvault/azcopy/v1/projects/PROJECT/snapshots/SNAPSHOT/manifest.json
+```
 
-The staging directory and state marker remain on failure so an operator has
-evidence and partial data. Podvault never merges into or replaces a nonempty
-tree.
+The manifest records source metadata, description, logical tree summary,
+Podvault/AzCopy versions, and the exact data prefix. It contains no SAS.
 
-## Retention and maintenance
+### AzCopy save commit protocol
 
-Every 0.1 snapshot has the system pin `podvault.retain-v1`. A user pin adds a
-label but is not the only retention mechanism. Ordinary commands pass
-`--no-auto-maintenance`; pruning and destructive maintenance are intentionally
-outside this release. Kopia still owns encryption, compression, content
-addressing, deduplication, repository indexes, and any operator-invoked
-maintenance.
+1. Validate and scan the complete source tree.
+2. Upload to a never-before-used generation using AzCopy recursive copy,
+   POSIX-property preservation, symbolic-link preservation, and Content-MD5.
+3. Write the immutable generation manifest.
+4. Replace the small project record so it points to the new generation.
+5. Write a success receipt.
+
+A failure before step 4 leaves the prior current-generation pointer unchanged.
+Orphaned completed generations are harmless. Podvault 0.2 does not delete or
+prune generations.
+
+### AzCopy restore
+
+1. Resolve the current or explicitly requested generation and validate its
+   manifest.
+2. Download into a randomized sibling staging path with AzCopy's MD5 mismatch
+   behavior set to fail.
+3. Compare the restored tree with the manifest.
+4. Rename the staged directory into place and write a receipt.
+
+`AZCOPY_CONCURRENCY_VALUE` defaults to `AUTO`. Because the whole tree is staged,
+`AZCOPY_DOWNLOAD_TO_TEMP_PATH` defaults to `false` to avoid redundant per-file
+temporary paths. Users may override either environment variable.
+
+Unlike the Kopia reconnect token, SAS authentication must appear in AzCopy's
+Azure URL and is therefore transiently visible in the AzCopy child process's
+arguments. Output and errors are redacted.
+
+## Restore failure state
+
+Both engines write a sibling `.podvault-restore-state-*.json` marker before
+transfer and preserve the marker and staging directory on interruption or
+failure. The requested destination is not exposed until verification passes.
+
+## Receipts
+
+Receipts live under the XDG state directory and include the engine, operation,
+stable snapshot ID, tree summary, timing information, and engine-specific
+identifiers. They never include SAS URLs or repository passwords.
 
 ## Direct Kopia access
 
-After Podvault connects, its standard Kopia config can be used directly:
+Kopia projects remain ordinary repositories. After Podvault connects:
 
 ```bash
-export KOPIA_PASSWORD="$PODVAULT_REPOSITORY_PASSWORD"
 CFG="${XDG_CONFIG_HOME:-$HOME/.config}/podvault/kopia.repository.config"
-
 kopia --config-file="$CFG" snapshot list --all --show-identical \
-  --tags=podvault.project:newlm --json
+  --tags=podvault.schema:1 --tags=podvault.project:newlm --json
 ```
 
-Read `rootEntry.obj` from the selected JSON manifest, then restore it:
-
-```bash
-kopia --config-file="$CFG" snapshot restore ROOT_OBJECT_ID /workspace/newlm-recovered
-```
-
-This path uses only Kopia's repository format. Podvault-specific tags are plain
-Kopia metadata. For reconnecting without an existing config, reinstalling
-Podvault is the safest way to feed the SAS without exposing it in a process
-listing; a standard-library token generator for a Kopia-only emergency is in
-[direct-kopia-recovery.md](direct-kopia-recovery.md).
+See [direct-kopia-recovery.md](direct-kopia-recovery.md) for reconstructing a
+connection without Podvault.

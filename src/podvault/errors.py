@@ -35,3 +35,15 @@ class KopiaCommandError(PodvaultError):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+class AzCopyCommandError(PodvaultError):
+    def __init__(self, message, returncode=1, stdout="", stderr=""):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class AzureStorageError(PodvaultError):
+    """A small Azure metadata request failed."""
