@@ -1,0 +1,17 @@
+{
+  "preferences": {
+    "large_file_bytes": 10737418240
+  },
+  "projects": {
+    "newlm": {
+      "path": "/workspace/newlm"
+    }
+  },
+  "repository": {
+    "container": "podvault",
+    "provider": "azure",
+    "storage_account": "exampleaccount",
+    "storage_domain": "blob.core.windows.net"
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,15 @@
+# Python bytecode and local environments
+__pycache__/
+*.pyc
+.venv/
+
+# Regenerable caches
+.cache/
+
+# Incomplete temporary writes
+**/*.tmp
+**/*.partial
+
+# Example only: this can exclude valuable checkpoints. Keep it only if every
+# step_* directory is truly reproducible or saved elsewhere.
+**/step_*/
