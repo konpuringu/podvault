@@ -64,20 +64,22 @@ def select_snapshot(
 
 
 def verify_manifest(
-    runner: KopiaRunner, manifest_id: str, sample_percent: float = 0.0
+    runner: KopiaRunner,
+    manifest_id: str,
+    sample_percent: float = 0.0,
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
     if sample_percent < 0 or sample_percent > 100:
         raise ConfigurationError("sample percentage must be between 0 and 100")
-    result = runner.run(
-        [
-            "--no-progress",
-            "snapshot",
-            "verify",
-            manifest_id,
-            "--verify-files-percent={}".format(sample_percent),
-            "--json",
-        ]
-    )
+    args = [
+        "--progress" if show_progress else "--no-progress",
+        "snapshot",
+        "verify",
+        manifest_id,
+        "--verify-files-percent={}".format(sample_percent),
+        "--json",
+    ]
+    result = runner.run_streaming(args) if show_progress else runner.run(args)
     values = parse_json_lines(result.stdout)
     final = values[-1] if values else {}
     if final.get("errorCount", 0) != 0:
@@ -99,29 +101,40 @@ class SnapshotService:
         self.console = console
         self.receipts = receipts
 
-    def dry_run(self, source: Path, project: str) -> Dict[str, Any]:
+    def dry_run(self, source: Path, project: str, show_progress: bool = True) -> Dict[str, Any]:
         self.console.info("Dry run for {} ({})".format(project, source))
-        result = self.runner.run(
-            [
-                "--no-progress",
-                "snapshot",
-                "estimate",
-                str(source),
-                "--show-files",
-                "--max-examples-per-bucket=100",
-            ]
-        )
-        text = (result.stdout + result.stderr).strip()
+        args = [
+            "--progress" if show_progress else "--no-progress",
+            "snapshot",
+            "estimate",
+            str(source),
+            "--show-files",
+            "--max-examples-per-bucket=100",
+        ]
+        result = self.runner.run_streaming(args) if show_progress else self.runner.run(args)
+        text = result.stdout.strip()
         return {"operation": "dry-run", "project": project, "source": str(source), "estimate": text}
 
-    def save(self, source: Path, project: str, description: str = "") -> Dict[str, Any]:
+    def save(
+        self,
+        source: Path,
+        project: str,
+        description: str = "",
+        show_progress: bool = True,
+    ) -> Dict[str, Any]:
         stable_id = uuid.uuid4().hex
         kopia_version = ".".join(str(part) for part in self.runner.version())
         tags = snapshot_tags(project, source, __version__, stable_id)
         tags["podvault.kopia-version"] = kopia_version
+        self.console.info("Checking {} for recently changing files...".format(project))
         warnings = risky_files(source)
         self.console.info("Saving {} from {}...".format(project, source))
-        args = ["--no-progress", "snapshot", "create", str(source)]
+        args = [
+            "--progress" if show_progress else "--no-progress",
+            "snapshot",
+            "create",
+            str(source),
+        ]
         args.extend(
             [
                 "--override-source={}".format(canonical_source(project)),
@@ -137,14 +150,17 @@ class SnapshotService:
             args.append("--tags={}:{}".format(key, value))
         manifest = None
         try:
-            result = self.runner.run(args)
+            result = self.runner.run_streaming(args) if show_progress else self.runner.run(args)
             manifest = parse_json_document(result.stdout)
             if not isinstance(manifest, dict) or not manifest.get("id"):
                 raise KopiaCommandError("snapshot creation did not return a manifest ID")
             summary = (manifest.get("rootEntry") or {}).get("summ") or {}
             if summary.get("numFailed", 0):
                 raise KopiaCommandError("snapshot contains failed entries")
-            verification = verify_manifest(self.runner, manifest["id"], 0)
+            self.console.info("Verifying uploaded snapshot...")
+            verification = verify_manifest(
+                self.runner, manifest["id"], 0, show_progress=show_progress
+            )
         except Exception as exc:
             receipt = {
                 "status": "failed",
@@ -181,9 +197,18 @@ class SnapshotService:
         receipt["receipt_path"] = str(receipt_path)
         return receipt
 
-    def verify(self, project: str, identifier: Optional[str], sample_percent: float) -> Dict[str, Any]:
+    def verify(
+        self,
+        project: str,
+        identifier: Optional[str],
+        sample_percent: float,
+        show_progress: bool = True,
+    ) -> Dict[str, Any]:
         snapshot = select_snapshot(list_snapshots(self.runner, project), identifier)
-        verification = verify_manifest(self.runner, snapshot["id"], sample_percent)
+        self.console.info("Verifying {}...".format(project))
+        verification = verify_manifest(
+            self.runner, snapshot["id"], sample_percent, show_progress=show_progress
+        )
         return {
             "status": "success",
             "project": project,

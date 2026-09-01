@@ -75,6 +75,9 @@ def _parser() -> argparse.ArgumentParser:
     save.add_argument("--name", help="stable project name when target is a path")
     save.add_argument("--description", default="")
     save.add_argument("--dry-run", action="store_true")
+    save.add_argument(
+        "--no-progress", action="store_true", help="disable live Kopia progress output"
+    )
 
     listing = commands.add_parser("list", help="list Podvault snapshots")
     listing.add_argument("project", nargs="?")
@@ -85,6 +88,9 @@ def _parser() -> argparse.ArgumentParser:
     restore_selection.add_argument("--latest", action="store_true", help="restore latest snapshot (default)")
     restore_selection.add_argument("--snapshot", help="stable Podvault or current Kopia snapshot ID")
     restore.add_argument("--to", dest="destination")
+    restore.add_argument(
+        "--no-progress", action="store_true", help="disable live Kopia progress output"
+    )
 
     verify = commands.add_parser("verify", help="verify a snapshot")
     verify.add_argument("project")
@@ -92,6 +98,9 @@ def _parser() -> argparse.ArgumentParser:
     verify_selection.add_argument("--latest", action="store_true", help="verify latest snapshot (default)")
     verify_selection.add_argument("--snapshot")
     verify.add_argument("--sample-percent", type=float, default=0.0)
+    verify.add_argument(
+        "--no-progress", action="store_true", help="disable live Kopia progress output"
+    )
 
     pin = commands.add_parser("pin", help="label and retain a snapshot")
     pin.add_argument("project")
@@ -275,13 +284,20 @@ class Application:
         project, source = self._project_source(self.args.target, self.args.name)
         service = self._snapshot_service(write=True, allow_create=True)
         if self.args.dry_run:
-            payload = service.dry_run(source, project)
+            payload = service.dry_run(
+                source, project, show_progress=not self.args.no_progress
+            )
             if self.console.json_mode:
                 self.console.result(payload, [])
             else:
                 print(payload["estimate"])
             return 0
-        payload = service.save(source, project, self.args.description)
+        payload = service.save(
+            source,
+            project,
+            self.args.description,
+            show_progress=not self.args.no_progress,
+        )
         for item in payload.get("warnings", []):
             self.console.warning("recently changing or incomplete-looking file: {}".format(item))
         human = [
@@ -322,7 +338,12 @@ class Application:
         project = validate_project_name(self.args.project)
         runner = self.repository.ensure_connected(write=False, allow_create=False)
         service = RestoreService(runner, self.console, self.receipts, self.config)
-        payload = service.restore(project, self.args.snapshot, self.args.destination)
+        payload = service.restore(
+            project,
+            self.args.snapshot,
+            self.args.destination,
+            show_progress=not self.args.no_progress,
+        )
         human = [
             "Restored {} to {}".format(project, payload["destination"]),
             "Structural verification: PASSED",
@@ -335,7 +356,12 @@ class Application:
     def _verify(self) -> int:
         project = validate_project_name(self.args.project)
         service = self._snapshot_service(write=False)
-        payload = service.verify(project, self.args.snapshot, self.args.sample_percent)
+        payload = service.verify(
+            project,
+            self.args.snapshot,
+            self.args.sample_percent,
+            show_progress=not self.args.no_progress,
+        )
         human = [
             "Verification passed for {} ({})".format(
                 project, payload["verification"]["mode"]

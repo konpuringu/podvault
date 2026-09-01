@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "podvault"
-version = "0.1.0"
+version = "0.1.1"
 description = "Safely save and restore ephemeral GPU-pod projects with Kopia"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,6 +24,11 @@ classifiers = [
   "Topic :: System :: Archiving :: Backup",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/konpuringu/podvault"
+Repository = "https://github.com/konpuringu/podvault"
+Issues = "https://github.com/konpuringu/podvault/issues"
 
 [project.scripts]
 podvault = "podvault.cli:main"

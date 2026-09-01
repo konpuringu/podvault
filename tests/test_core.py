@@ -11,7 +11,7 @@ from pathlib import Path
 from podvault.azure import parse_sas_url
 from podvault.config import ConfigStore
 from podvault.errors import CredentialError, KopiaCommandError, SafetyError, VerificationError
-from podvault.kopia import CommandResult
+from podvault.kopia import CommandResult, KopiaRunner
 from podvault.output import Console
 from podvault.paths import validate_destination, validate_source
 from podvault.project import canonical_source, snapshot_tags
@@ -70,7 +70,7 @@ class SafetyTests(unittest.TestCase):
 class ProjectIdentityTests(unittest.TestCase):
     def test_identity_is_independent_of_host_and_source(self):
         with tempfile.TemporaryDirectory() as directory:
-            tags = snapshot_tags("newlm", Path(directory), "0.1.0", "stable-id")
+            tags = snapshot_tags("newlm", Path(directory), "0.1.1", "stable-id")
         self.assertEqual(canonical_source("newlm"), "podvault@podvault:/projects/newlm")
         self.assertEqual(tags["podvault.project"], "newlm")
         self.assertEqual(tags["podvault.snapshot"], "stable-id")
@@ -121,6 +121,9 @@ class FailingVerifyRunner:
     def version(self):
         return (0, 23, 1)
 
+    def run_streaming(self, args, **kwargs):
+        return self.run(args, **kwargs)
+
     def run(self, args, **kwargs):
         if "create" in args:
             manifest = {
@@ -155,6 +158,9 @@ class FailureReceiptTests(unittest.TestCase):
 
 
 class FailingRestoreRunner:
+    def run_streaming(self, args, **kwargs):
+        return self.run(args, **kwargs)
+
     def run(self, args, **kwargs):
         if "list" in args:
             snapshot = {
@@ -198,6 +204,38 @@ class InterruptedRestoreTests(unittest.TestCase):
             self.assertEqual(len(markers), 1)
             state = json.loads(markers[0].read_text(encoding="utf-8"))
             self.assertEqual(state["status"], "interrupted-or-failed")
+
+
+class StreamingProgressTests(unittest.TestCase):
+    def test_streams_progress_and_redacts_complete_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "fake-kopia"
+            helper.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "secret = os.environ.get('KOPIA_PASSWORD', '')\n"
+                "sys.stderr.write('uploaded 25 GB, estimated 100 GB (25.0%) 3m left\\r')\n"
+                "sys.stderr.flush()\n"
+                "sys.stderr.write('diagnostic password=' + secret + '\\n')\n"
+                "sys.stderr.flush()\n"
+                "sys.stdout.write('{\"id\":\"manifest-id\"}\\n')\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            progress = io.StringIO()
+            runner = KopiaRunner(
+                root / "repository.config",
+                password="streaming-secret",
+                executable=str(helper),
+                known_secrets=["streaming-secret"],
+            )
+            result = runner.run_streaming(["snapshot", "create"], progress_stream=progress)
+            displayed = progress.getvalue()
+            self.assertIn("estimated 100 GB (25.0%) 3m left", displayed)
+            self.assertIn("[REDACTED]", displayed)
+            self.assertNotIn("streaming-secret", displayed)
+            self.assertEqual(json.loads(result.stdout)["id"], "manifest-id")
 
 
 if __name__ == "__main__":

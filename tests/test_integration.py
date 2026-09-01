@@ -83,6 +83,8 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
         first = json.loads(output)
         self.assertTrue(first["safe_to_terminate"])
         self.assertNotIn("SAFE TO TERMINATE: YES", error)
+        self.assertIn("Snapshotting", error)
+        self.assertIn("uploaded", error)
 
         (self.source / "file with spaces.txt").write_text("version two", encoding="utf-8")
         with mock.patch("podvault.project.socket.gethostname", return_value="simulated-pod-two"):
@@ -92,6 +94,19 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
         self.assertEqual(code, 0, error)
         second = json.loads(output)
         self.assertNotEqual(first["podvault_snapshot_id"], second["podvault_snapshot_id"])
+
+        code, output, error = self.call(
+            self.config1,
+            "save",
+            "newlm",
+            "--dry-run",
+            "--no-progress",
+            json_mode=True,
+        )
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(output)["operation"], "dry-run")
+        self.assertNotIn("Analyzing", error)
+        self.assertNotIn("hashing", error)
 
         code, _, error = self.call(
             self.config2,

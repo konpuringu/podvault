@@ -9,7 +9,7 @@ Podvault does not define a backup format or run a server. The repository is an
 ordinary, encrypted Kopia repository in your Azure container, so it remains
 accessible with Kopia itself.
 
-> **Status:** 0.1.0 is an alpha release. Test the workflow with non-critical
+> **Status:** 0.1.1 is an alpha release. Test the workflow with non-critical
 > data before making it your only recovery path.
 
 ## The shortest complete workflow
@@ -75,7 +75,8 @@ Podvault never installs or upgrades Kopia during a save or restore.
 Install the release wheel:
 
 ```bash
-python3 -m pip install podvault-0.1.0-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.1.1/podvault-0.1.1-py3-none-any.whl
+python3 -m pip install podvault-0.1.1-py3-none-any.whl
 kopia --version
 podvault doctor
 ```
@@ -84,7 +85,8 @@ For a fresh Linux pod, the explicit bootstrap helper installs a checksum-pinned
 Kopia binary and the supplied wheel under `~/.local`:
 
 ```bash
-bash scripts/bootstrap-linux.sh dist/podvault-0.1.0-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.1.1/bootstrap-linux.sh
+bash bootstrap-linux.sh podvault-0.1.1-py3-none-any.whl
 export PATH="$HOME/.local/bin:$PATH"
 podvault doctor
 ```
@@ -139,11 +141,11 @@ podvault repository connect azure [--sas-url-file FILE] [--repository-password-f
 podvault repository status
 
 podvault configure PATH --name PROJECT
-podvault save PATH --name PROJECT [--description TEXT] [--dry-run]
-podvault save PROJECT [--description TEXT] [--dry-run]
+podvault save PATH --name PROJECT [--description TEXT] [--dry-run] [--no-progress]
+podvault save PROJECT [--description TEXT] [--dry-run] [--no-progress]
 podvault list [PROJECT]
-podvault restore PROJECT [--latest | --snapshot ID] [--to PATH]
-podvault verify PROJECT [--latest | --snapshot ID] [--sample-percent N]
+podvault restore PROJECT [--latest | --snapshot ID] [--to PATH] [--no-progress]
+podvault verify PROJECT [--latest | --snapshot ID] [--sample-percent N] [--no-progress]
 podvault pin PROJECT [--latest | --snapshot ID] --label TEXT
 podvault credentials update [--sas-url-file FILE] [--repository-password-file FILE]
 podvault doctor
@@ -156,6 +158,15 @@ isolate all local Podvault state for a particular setup:
 podvault --json save newlm
 podvault --config /secure/podvault/config.json list newlm
 ```
+
+Live Kopia progress is enabled by default for saves, dry runs, restores, and
+verification. During a large save it reports hashing, cached logical data,
+uploaded bytes, a rolling estimated total, completion percentage, and ETA once
+Kopia has scanned enough content to estimate them. Early updates say
+`estimating...`; percentages and ETAs can move as more files are discovered and
+deduplication or upload throughput changes. Progress goes to standard error, so
+`--json` keeps standard output valid JSON. Use `--no-progress` when a quiet
+automation log is preferable.
 
 The filesystem repository commands exist for development and air-gapped tests:
 

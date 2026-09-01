@@ -70,13 +70,17 @@ class RestoreService:
         project: str,
         identifier: Optional[str],
         destination_value: Optional[str],
+        show_progress: bool = True,
     ) -> Dict[str, Any]:
         snapshot = select_snapshot(list_snapshots(self.runner, project), identifier)
         root_entry = snapshot.get("rootEntry") or {}
         root_object_id = root_entry.get("obj")
         if not root_object_id:
             raise VerificationError("snapshot does not contain a root object ID")
-        verification = verify_manifest(self.runner, snapshot["id"], 0)
+        self.console.info("Verifying selected snapshot...")
+        verification = verify_manifest(
+            self.runner, snapshot["id"], 0, show_progress=show_progress
+        )
         configured = self.config.get_project(project)
         default_destination = configured.get("path") if configured else "/workspace/{}".format(project)
         destination = validate_destination(destination_value or default_destination)
@@ -99,21 +103,23 @@ class RestoreService:
         atomic_json_write(marker, state, 0o600)
         self.console.info("Restoring {} into a temporary directory...".format(project))
         try:
-            self.runner.run(
-                [
-                    "--no-progress",
-                    "snapshot",
-                    "restore",
-                    root_object_id,
-                    str(staging),
-                    "--no-overwrite-files",
-                    "--no-overwrite-directories",
-                    "--no-overwrite-symlinks",
-                    "--write-files-atomically",
-                    "--flush-files",
-                    "--no-ignore-permission-errors",
-                ]
-            )
+            args = [
+                "--progress" if show_progress else "--no-progress",
+                "snapshot",
+                "restore",
+                root_object_id,
+                str(staging),
+                "--no-overwrite-files",
+                "--no-overwrite-directories",
+                "--no-overwrite-symlinks",
+                "--write-files-atomically",
+                "--flush-files",
+                "--no-ignore-permission-errors",
+            ]
+            if show_progress:
+                self.runner.run_streaming(args)
+            else:
+                self.runner.run(args)
             actual = local_tree_summary(staging)
             compare_summary(root_entry.get("summ") or {}, actual)
             if destination.is_symlink():

@@ -56,6 +56,13 @@ also mode 0600 because it contains sensitive connection material.
 Any exception after the snapshot starts produces a failure receipt when
 possible. A failed verification never reaches the success output path.
 
+Kopia's final JSON stays on standard output while its CR/LF-delimited progress
+records are streamed through a redacting adapter to standard error. This keeps
+`--json` machine-readable and prevents known SAS/password values from being
+echoed if a diagnostic appears alongside progress. Kopia's estimate evolves as
+the tree is scanned; Podvault does not add a second pre-scan merely to produce a
+fixed denominator.
+
 ## Restore transaction
 
 1. Find project manifests by tags and select latest or an explicit stable/current
