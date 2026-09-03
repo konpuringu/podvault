@@ -1,24 +1,24 @@
 # Bootstrap a fresh pod
 
-Podvault 0.2.0 supports Linux x86-64 and ARM64. Transfer these trusted release
+Podvault 0.3.0 supports Linux x86-64 and ARM64. Transfer these trusted release
 files to the pod:
 
 ```text
 bootstrap-linux.sh
-podvault-0.2.0-py3-none-any.whl
+podvault-0.3.0-py3-none-any.whl
 ```
 
 They can be downloaded from the public release:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/bootstrap-linux.sh
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/podvault-0.2.0-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.3.0/bootstrap-linux.sh
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.3.0/podvault-0.3.0-py3-none-any.whl
 ```
 
 Review the shell script, then install under `~/.local`:
 
 ```bash
-bash bootstrap-linux.sh podvault-0.2.0-py3-none-any.whl
+bash bootstrap-linux.sh podvault-0.3.0-py3-none-any.whl
 export PATH="$HOME/.local/bin:$PATH"
 podvault --version
 kopia --version
@@ -42,7 +42,7 @@ the wheel in a virtual environment:
 
 ```bash
 python3 -m venv /opt/podvault-venv
-/opt/podvault-venv/bin/pip install ./podvault-0.2.0-py3-none-any.whl
+/opt/podvault-venv/bin/pip install ./podvault-0.3.0-py3-none-any.whl
 ln -s /opt/podvault-venv/bin/podvault /usr/local/bin/podvault
 
 podvault --version
