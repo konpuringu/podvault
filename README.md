@@ -13,7 +13,7 @@ The engine is stored in both local configuration and a small remote project
 record. Later commands need only the project name; Podvault refuses to open an
 existing project with the other engine.
 
-> **Status:** 0.2.0 is an alpha release. Test the complete save/restore workflow
+> **Status:** 0.3.0 is an alpha release. Test the complete save/restore workflow
 > with non-critical data before making it your only recovery path.
 
 ## Choose an engine
@@ -120,8 +120,8 @@ Requirements are Linux and Python 3.9 or newer. Kopia projects require Kopia
 Install the release wheel when the transfer binaries are already available:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/podvault-0.2.0-py3-none-any.whl
-python3 -m pip install podvault-0.2.0-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.3.0/podvault-0.3.0-py3-none-any.whl
+python3 -m pip install podvault-0.3.0-py3-none-any.whl
 podvault doctor
 ```
 
@@ -129,8 +129,8 @@ The bootstrap helper installs checksum-pinned Kopia 0.23.1, AzCopy 10.32.6,
 and the supplied wheel under `~/.local`:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/bootstrap-linux.sh
-bash bootstrap-linux.sh podvault-0.2.0-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.3.0/bootstrap-linux.sh
+bash bootstrap-linux.sh podvault-0.3.0-py3-none-any.whl
 export PATH="$HOME/.local/bin:$PATH"
 podvault doctor
 ```
@@ -279,7 +279,7 @@ into place. POSIX metadata and symbolic links are preserved using AzCopy's Blob
 metadata support.
 
 AzCopy generations are not compressed or deduplicated and Podvault does not
-automatically prune them in 0.2.0. Each successful save therefore adds
+automatically prune them. Each successful save therefore adds
 approximately one complete project tree to Azure storage. `podvault delete`
 removes every generation for the selected project. Use a dedicated container
 and monitor its size.

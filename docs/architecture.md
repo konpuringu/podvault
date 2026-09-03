@@ -69,7 +69,7 @@ the Kopia command arguments.
    selected root or subtree summary.
 6. Rename the staged directory into place and write a receipt.
 
-Normal 0.2 restores intentionally leave Kopia's per-file atomic-write and flush
+Normal restores intentionally leave Kopia's per-file atomic-write and flush
 options disabled. The entire tree is already isolated until validation and
 promotion. `--durable` enables both slower options for users who explicitly
 need them.
@@ -105,8 +105,8 @@ Podvault/AzCopy versions, and the exact data prefix. It contains no SAS.
 5. Write a success receipt.
 
 A failure before step 4 leaves the prior current-generation pointer unchanged.
-Orphaned completed generations are harmless. Podvault 0.2 does not delete or
-prune generations.
+Orphaned completed generations are harmless. Podvault does not prune
+generations automatically.
 
 ### AzCopy restore
 

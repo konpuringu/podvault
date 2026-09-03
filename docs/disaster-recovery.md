@@ -10,7 +10,7 @@ This procedure assumes the previous pod and all local Podvault state are gone.
 - For a Kopia project, the original repository password.
 - A trusted Podvault release or source checkout.
 
-The remote project record lets Podvault 0.2 discover the engine and current
+The remote project record lets Podvault discover the engine and current
 AzCopy generation. Projects created with 0.1 have no record and default to
 Kopia. The old source path, hostname, local configuration, and receipt are not
 required.

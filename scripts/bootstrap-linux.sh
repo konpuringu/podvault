@@ -8,7 +8,7 @@ DATA_ROOT=${PODVAULT_INSTALL_DATA_ROOT:-"$HOME/.local/share/podvault"}
 WHEEL_PATH=${1:-}
 
 if [ -z "$WHEEL_PATH" ] || [ ! -f "$WHEEL_PATH" ]; then
-  echo "usage: $0 /path/to/podvault-0.2.0-py3-none-any.whl" >&2
+  echo "usage: $0 /path/to/podvault-0.3.0-py3-none-any.whl" >&2
   exit 2
 fi
 
