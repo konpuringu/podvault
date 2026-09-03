@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import __version__
 from .azure import AzureBlobClient, AzureSAS, parse_sas_url
 from .azcopy import AzCopyRunner
+from .browse import kopia_tree
 from .catalog import ProjectCatalog, SUPPORTED_ENGINES
 from .config import ConfigStore
 from .credentials import CredentialStore
@@ -20,12 +21,12 @@ from .direct import AzCopyService
 from .errors import ConfigurationError, PodvaultError
 from .kopia import KopiaRunner
 from .output import Console
-from .paths import AppPaths, validate_source
+from .paths import AppPaths, validate_relative_path, validate_source
 from .project import validate_project_name
 from .receipts import ReceiptStore
 from .repository import RepositoryManager
 from .restore import RestoreService
-from .snapshots import SnapshotService, list_snapshots, snapshot_view
+from .snapshots import SnapshotService, list_snapshots, select_snapshot, snapshot_view
 
 
 def _positive_int(value: str) -> int:
@@ -103,6 +104,15 @@ def _parser() -> argparse.ArgumentParser:
     listing.add_argument("project", nargs="?")
     listing.add_argument("--engine", choices=SUPPORTED_ENGINES, default=None)
 
+    tree = commands.add_parser("tree", help="browse a snapshot without restoring it")
+    tree.add_argument("project")
+    tree.add_argument("--engine", choices=SUPPORTED_ENGINES, default=None)
+    tree_selection = tree.add_mutually_exclusive_group()
+    tree_selection.add_argument("--latest", action="store_true", help="browse latest snapshot (default)")
+    tree_selection.add_argument("--snapshot", help="stable Podvault or engine snapshot ID")
+    tree.add_argument("--path", help="relative directory within the project")
+    tree.add_argument("--recursive", action="store_true")
+
     restore = commands.add_parser("restore", help="restore a project")
     restore.add_argument("project")
     restore.add_argument("--engine", choices=SUPPORTED_ENGINES, default=None)
@@ -110,6 +120,10 @@ def _parser() -> argparse.ArgumentParser:
     restore_selection.add_argument("--latest", action="store_true", help="restore latest snapshot (default)")
     restore_selection.add_argument("--snapshot", help="stable Podvault or current Kopia snapshot ID")
     restore.add_argument("--to", dest="destination")
+    restore.add_argument(
+        "--path",
+        help="restore one relative directory; requires --to",
+    )
     restore.add_argument(
         "--parallel",
         type=_positive_int,
@@ -143,6 +157,23 @@ def _parser() -> argparse.ArgumentParser:
     pin_selection.add_argument("--latest", action="store_true", help="pin latest snapshot (default)")
     pin_selection.add_argument("--snapshot")
     pin.add_argument("--label", required=True)
+
+    delete = commands.add_parser(
+        "delete", help="permanently delete a remote project and all of its snapshots"
+    )
+    delete.add_argument("project")
+    delete.add_argument("--engine", choices=SUPPORTED_ENGINES, default=None)
+    delete.add_argument(
+        "--yes", action="store_true", help="skip the interactive project-name confirmation"
+    )
+    delete.add_argument(
+        "--no-maintenance",
+        action="store_true",
+        help="Kopia: skip full maintenance after deleting snapshots",
+    )
+    delete.add_argument(
+        "--no-progress", action="store_true", help="disable live deletion progress output"
+    )
 
     commands.add_parser("doctor", help="check dependencies, credentials, and repository access")
     return parser
@@ -189,10 +220,14 @@ class Application:
         source = validate_source(source_value, self._protected_paths())
         return project, source
 
-    def _azure_context(self, write: bool, azcopy: bool = False) -> Tuple[AzureSAS, AzureBlobClient, ProjectCatalog]:
+    def _azure_context(
+        self, write: bool, azcopy: bool = False, delete: bool = False
+    ) -> Tuple[AzureSAS, AzureBlobClient, ProjectCatalog]:
         value = self.credentials.require_sas_url(prompt=True)
         sas = parse_sas_url(value)
-        if azcopy:
+        if delete:
+            sas.require_delete_permissions(repository_write=write and not azcopy)
+        elif azcopy:
             sas.require_azcopy_permissions(write=write)
         else:
             sas.require_permissions(write=write)
@@ -236,8 +271,12 @@ class Application:
                 )
         return selected
 
-    def _azcopy_service(self, write: bool) -> Tuple[AzCopyService, ProjectCatalog]:
-        sas, blobs, catalog = self._azure_context(write=write, azcopy=True)
+    def _azcopy_service(
+        self, write: bool, delete: bool = False
+    ) -> Tuple[AzCopyService, ProjectCatalog]:
+        sas, blobs, catalog = self._azure_context(
+            write=write, azcopy=True, delete=delete
+        )
         runner = AzCopyRunner(
             self.paths.state_dir,
             known_secrets=[sas.url, sas.token],
@@ -272,12 +311,16 @@ class Application:
             return self._save()
         if command == "list":
             return self._list()
+        if command == "tree":
+            return self._tree()
         if command == "restore":
             return self._restore()
         if command == "verify":
             return self._verify()
         if command == "pin":
             return self._pin()
+        if command == "delete":
+            return self._delete()
         if command == "doctor":
             return self._doctor()
         raise ConfigurationError("unknown command")
@@ -515,6 +558,9 @@ class Application:
 
     def _restore(self) -> int:
         project = validate_project_name(self.args.project)
+        selected_path = validate_relative_path(self.args.path)
+        if selected_path and not self.args.destination:
+            raise ConfigurationError("--path requires an explicit --to destination")
         engine = self._resolve_engine(project, self.args.engine)
         if engine == "azcopy":
             if self.args.parallel is not None or self.args.durable:
@@ -527,6 +573,7 @@ class Application:
                 self.args.snapshot,
                 self.args.destination,
                 show_progress=not self.args.no_progress,
+                relative_path=selected_path,
             )
         else:
             runner = self.repository.ensure_connected(write=False, allow_create=False)
@@ -539,14 +586,66 @@ class Application:
                 show_progress=not self.args.no_progress,
                 parallel=parallel,
                 durable=self.args.durable,
+                relative_path=selected_path,
             )
+        selection = ":{}".format(selected_path) if selected_path else ""
         human = [
-            "Restored {} to {}".format(project, payload["destination"]),
+            "Restored {}{} to {}".format(project, selection, payload["destination"]),
             "Engine: {}".format(engine),
             "Structural verification: PASSED",
             "Restored tree verification: PASSED",
             "Receipt: {}".format(payload["receipt_path"]),
         ]
+        self.console.result(payload, human)
+        return 0
+
+    def _tree(self) -> int:
+        project = validate_project_name(self.args.project)
+        selected_path = validate_relative_path(self.args.path)
+        engine = self._resolve_engine(project, self.args.engine)
+        if engine == "azcopy":
+            service, _ = self._azcopy_service(write=False)
+            payload = service.tree(
+                project,
+                self.args.snapshot,
+                selected_path,
+                recursive=self.args.recursive,
+            )
+        else:
+            runner = self.repository.ensure_connected(write=False, allow_create=False)
+            snapshot = select_snapshot(list_snapshots(runner, project), self.args.snapshot)
+            view = snapshot_view(snapshot)
+            root_object_id = str(view.get("kopia_root_object_id") or "")
+            if not root_object_id:
+                raise ConfigurationError("snapshot does not contain a root object ID")
+            listing = kopia_tree(
+                runner, root_object_id, selected_path, recursive=self.args.recursive
+            )
+            payload = {
+                "status": "success",
+                "operation": "tree",
+                "engine": "kopia",
+                "project": project,
+                "podvault_snapshot_id": view.get("podvault_snapshot_id"),
+                "kopia_manifest_id": view.get("kopia_manifest_id"),
+                "kopia_root_object_id": root_object_id,
+                "path": selected_path or ".",
+                "recursive": self.args.recursive,
+                "summary": listing["summary"],
+                "entries": listing["entries"],
+                "count": len(listing["entries"]),
+            }
+        human = []
+        for item in payload["entries"]:
+            path = str(item.get("path") or "")
+            kind = item.get("type")
+            if kind == "directory":
+                path += "/"
+            elif kind == "symlink":
+                path += "@"
+            human.append(path)
+        if not human:
+            human.append("No entries under {}.".format(selected_path or "."))
         self.console.result(payload, human)
         return 0
 
@@ -585,6 +684,128 @@ class Application:
             "Pinned {} with label '{}'".format(project, self.args.label),
             "Current Kopia manifest: {}".format(payload["kopia_manifest_id"]),
         ]
+        self.console.result(payload, human)
+        return 0
+
+    def _confirm_delete(self, project: str, engine: str, description: str) -> None:
+        self.console.warning(
+            "This permanently deletes remote project '{}' ({}) and {}. "
+            "The local project directory will not be touched.".format(
+                project, engine, description
+            )
+        )
+        if self.args.yes:
+            return
+        if self.console.json_mode:
+            raise ConfigurationError("delete requires --yes when using --json")
+        if not sys.stdin.isatty():
+            raise ConfigurationError(
+                "delete requires --yes when standard input is not a terminal"
+            )
+        try:
+            response = input("Type the project name '{}' to confirm: ".format(project))
+        except EOFError as exc:
+            raise ConfigurationError("deletion cancelled; project was not changed") from exc
+        if response != project:
+            raise ConfigurationError("deletion cancelled; project was not changed")
+
+    def _delete(self) -> int:
+        project = validate_project_name(self.args.project)
+        engine = self._resolve_engine(project, self.args.engine)
+        configured = self.config.get_project(project)
+        remote_record = self._remote_project_record(project)
+        catalog: Optional[ProjectCatalog] = None
+        azcopy_service: Optional[AzCopyService] = None
+
+        if engine == "azcopy":
+            if self.args.no_maintenance:
+                raise ConfigurationError(
+                    "--no-maintenance applies only to Kopia projects"
+                )
+            if (
+                not remote_record
+                and not configured
+                and self.args.engine != "azcopy"
+            ):
+                raise ConfigurationError(
+                    "project not found: {}; use --engine azcopy to remove orphaned "
+                    "AzCopy data".format(project)
+                )
+            azcopy_service, _ = self._azcopy_service(write=False, delete=True)
+            description = "every stored generation"
+            snapshots: List[Dict[str, Any]] = []
+        else:
+            runner = self.repository.ensure_connected(write=False, allow_create=False)
+            snapshots = list_snapshots(runner, project, include_incomplete=True)
+            if not snapshots and not remote_record and not configured:
+                raise ConfigurationError("project not found: {}".format(project))
+            if self.config.repository.get("provider") == "azure":
+                _, _, catalog = self._azure_context(write=True, delete=True)
+            description = "{} Kopia snapshot{}".format(
+                len(snapshots), "" if len(snapshots) == 1 else "s"
+            )
+
+        self._confirm_delete(project, engine, description)
+
+        try:
+            if engine == "azcopy":
+                if azcopy_service is None:
+                    raise ConfigurationError("AzCopy deletion service is unavailable")
+                payload = azcopy_service.delete_project(
+                    project, show_progress=not self.args.no_progress
+                )
+            else:
+                runner = self.repository.ensure_connected(write=True, allow_create=False)
+                service = SnapshotService(runner, self.console, self.receipts)
+                payload = service.delete_project(
+                    project,
+                    snapshots=snapshots,
+                    show_progress=not self.args.no_progress,
+                    run_maintenance=not self.args.no_maintenance,
+                )
+                if catalog is not None:
+                    payload["catalog_record_deleted"] = catalog.delete(project)
+
+            payload["local_configuration_deleted"] = self.config.remove_project(project)
+            payload["local_directory_deleted"] = False
+        except Exception as exc:
+            failure = {
+                "status": "failed-or-partial",
+                "operation": "delete",
+                "engine": engine,
+                "project": project,
+                "requested_kopia_manifest_ids": [
+                    str(item.get("id") or "") for item in snapshots
+                ],
+                "local_directory_deleted": False,
+                "error": str(exc),
+            }
+            failure_receipt = self.receipts.write(project, "delete", failure)
+            setattr(exc, "receipt_path", failure_receipt)
+            raise
+
+        receipt_path = self.receipts.write(project, "delete", payload)
+        payload["receipt_path"] = str(receipt_path)
+
+        maintenance = payload.get("maintenance") or {}
+        if maintenance.get("status") in ("failed", "skipped"):
+            self.console.warning(str(maintenance.get("note")))
+        human = [
+            "Deleted remote project: {} ({})".format(project, engine),
+            "Local project directory deleted: NO",
+        ]
+        if engine == "kopia":
+            human.extend(
+                [
+                    "Kopia snapshots deleted: {}".format(
+                        payload["deleted_snapshot_count"]
+                    ),
+                    "Kopia maintenance: {}".format(maintenance.get("status")),
+                ]
+            )
+        else:
+            human.append("AzCopy generations deleted: ALL")
+        human.append("Receipt: {}".format(payload["receipt_path"]))
         self.console.result(payload, human)
         return 0
 

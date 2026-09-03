@@ -7,11 +7,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .browse import resolve_kopia_directory
 from .config import ConfigStore, atomic_json_write
-from .errors import DestinationConflictError, VerificationError
+from .errors import ConfigurationError, DestinationConflictError, VerificationError
 from .kopia import KopiaRunner
 from .output import Console
-from .paths import validate_destination
+from .paths import validate_destination, validate_relative_path
 from .receipts import ReceiptStore, utc_now
 from .snapshots import _tag, list_snapshots, select_snapshot, verify_manifest
 
@@ -95,8 +96,12 @@ class RestoreService:
         show_progress: bool = True,
         parallel: int = 32,
         durable: bool = False,
+        relative_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         operation_started = time.monotonic()
+        selected_path = validate_relative_path(relative_path)
+        if selected_path and not destination_value:
+            raise ConfigurationError("--path requires an explicit --to destination")
         snapshot = select_snapshot(list_snapshots(self.runner, project), identifier)
         root_entry = snapshot.get("rootEntry") or {}
         root_object_id = root_entry.get("obj")
@@ -108,6 +113,17 @@ class RestoreService:
             self.runner, snapshot["id"], 0, show_progress=show_progress
         )
         verify_seconds = time.monotonic() - verify_started
+        restore_object_id = str(root_object_id)
+        restore_source = restore_object_id
+        expected_summary = root_entry.get("summ") or {}
+        if selected_path:
+            self.console.info("Resolving snapshot directory {}...".format(selected_path))
+            selected = resolve_kopia_directory(
+                self.runner, restore_object_id, selected_path
+            )
+            restore_object_id = str(selected["object_id"])
+            restore_source = str(root_object_id).rstrip("/") + "/" + selected_path
+            expected_summary = selected["summary"]
         configured = self.config.get_project(project)
         default_destination = configured.get("path") if configured else "/workspace/{}".format(project)
         destination = validate_destination(destination_value or default_destination)
@@ -125,17 +141,24 @@ class RestoreService:
             "staging": str(staging),
             "kopia_manifest_id": snapshot["id"],
             "kopia_root_object_id": root_object_id,
+            "restore_object_id": restore_object_id,
+            "restore_source": restore_source,
+            "path": selected_path or ".",
+            "selective": bool(selected_path),
             "started_at": utc_now(),
         }
         atomic_json_write(marker, state, 0o600)
-        self.console.info("Restoring {} into a temporary directory...".format(project))
+        selection = ":{}".format(selected_path) if selected_path else ""
+        self.console.info(
+            "Restoring {}{} into a temporary directory...".format(project, selection)
+        )
         try:
             transfer_started = time.monotonic()
             args = [
                 "--progress" if show_progress else "--no-progress",
                 "snapshot",
                 "restore",
-                root_object_id,
+                restore_source,
                 str(staging),
                 "--no-overwrite-files",
                 "--no-overwrite-directories",
@@ -152,7 +175,7 @@ class RestoreService:
             transfer_seconds = time.monotonic() - transfer_started
             scan_started = time.monotonic()
             actual = local_tree_summary(staging)
-            compare_summary(root_entry.get("summ") or {}, actual)
+            compare_summary(expected_summary, actual)
             scan_seconds = time.monotonic() - scan_started
             promote_staging(staging, destination)
         except BaseException:
@@ -164,7 +187,8 @@ class RestoreService:
             marker.unlink()
         except OSError:
             pass
-        self.config.set_project(project, destination, engine="kopia")
+        if not selected_path:
+            self.config.set_project(project, destination, engine="kopia")
         total_seconds = time.monotonic() - operation_started
         receipt = {
             "status": "success",
@@ -173,6 +197,10 @@ class RestoreService:
             "podvault_snapshot_id": _tag(snapshot, "podvault.snapshot"),
             "kopia_manifest_id": snapshot["id"],
             "kopia_root_object_id": root_object_id,
+            "restore_object_id": restore_object_id,
+            "restore_source": restore_source,
+            "path": selected_path or ".",
+            "selective": bool(selected_path),
             "repository_verification": verification,
             "restored_summary": actual,
             "restore_parallelism": parallel,

@@ -74,6 +74,18 @@ class AzureSAS:
                 )
             )
 
+    def require_delete_permissions(self, repository_write: bool = False) -> None:
+        required = {"r", "l", "d"}
+        if repository_write:
+            required.add("w")
+        missing = required - self.permissions
+        if missing:
+            raise CredentialError(
+                "Azure container SAS is missing permission(s) required for deletion: {}".format(
+                    ", ".join(sorted(missing))
+                )
+            )
+
     def blob_url(self, blob_path: str, wildcard: bool = False) -> str:
         parsed = urlsplit(self.url)
         safe = "/" + ("*" if wildcard else "")
@@ -177,6 +189,31 @@ class AzureBlobClient:
                 "unable to write Azure project metadata at {}: {}".format(blob_path, exc)
             ) from exc
 
+    def delete_blob(self, blob_path: str, missing_ok: bool = False) -> bool:
+        headers = self._headers()
+        headers["x-ms-delete-snapshots"] = "include"
+        request = Request(
+            self.sas.blob_url(blob_path), headers=headers, method="DELETE"
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                response.read()
+            return True
+        except HTTPError as exc:
+            if missing_ok and exc.code == 404:
+                return False
+            raise AzureStorageError(
+                "unable to delete Azure project metadata at {}: HTTP {}".format(
+                    blob_path, exc.code
+                )
+            ) from exc
+        except (URLError, OSError) as exc:
+            raise AzureStorageError(
+                "unable to delete Azure project metadata at {}: {}".format(
+                    blob_path, exc
+                )
+            ) from exc
+
     def get_json(self, blob_path: str, missing_ok: bool = False) -> Optional[Dict[str, Any]]:
         request = Request(self.sas.blob_url(blob_path), headers=self._headers(), method="GET")
         try:
@@ -206,7 +243,12 @@ class AzureBlobClient:
             )
         return value
 
-    def list_blobs(self, prefix: str) -> List[Dict[str, Any]]:
+    def list_blobs(
+        self,
+        prefix: str,
+        include_metadata: bool = False,
+        delimiter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         parsed = urlsplit(self.sas.url)
         result: List[Dict[str, Any]] = []
         marker = ""
@@ -214,6 +256,10 @@ class AzureBlobClient:
             query = parsed.query + "&restype=container&comp=list&prefix=" + quote(
                 prefix, safe="/"
             )
+            if include_metadata:
+                query += "&include=metadata"
+            if delimiter is not None:
+                query += "&delimiter=" + quote(delimiter, safe="")
             if marker:
                 query += "&marker=" + quote(marker, safe="")
             url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
@@ -231,15 +277,32 @@ class AzureBlobClient:
                 root = ET.fromstring(raw)
             except ET.ParseError as exc:
                 raise AzureStorageError("Azure blob listing returned invalid XML") from exc
+            for item in root.findall("./Blobs/BlobPrefix"):
+                name = item.findtext("Name")
+                if name:
+                    result.append(
+                        {
+                            "name": name,
+                            "size": None,
+                            "metadata": {},
+                            "type": "directory",
+                        }
+                    )
             for item in root.findall("./Blobs/Blob"):
                 name = item.findtext("Name")
                 if not name:
                     continue
                 length = item.findtext("./Properties/Content-Length")
+                metadata = {
+                    child.tag.lower(): child.text or ""
+                    for child in item.findall("./Metadata/*")
+                }
                 result.append(
                     {
                         "name": name,
                         "size": int(length) if length and length.isdigit() else None,
+                        "metadata": metadata,
+                        "last_modified": item.findtext("./Properties/Last-Modified"),
                     }
                 )
             marker = root.findtext("NextMarker") or ""

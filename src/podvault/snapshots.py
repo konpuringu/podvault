@@ -17,7 +17,11 @@ def _tag(snapshot: Dict[str, Any], name: str) -> Optional[str]:
     return tags.get("tag:" + name) or tags.get(name)
 
 
-def list_snapshots(runner: KopiaRunner, project: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_snapshots(
+    runner: KopiaRunner,
+    project: Optional[str] = None,
+    include_incomplete: bool = False,
+) -> List[Dict[str, Any]]:
     args = [
         "--no-progress",
         "snapshot",
@@ -27,6 +31,8 @@ def list_snapshots(runner: KopiaRunner, project: Optional[str] = None) -> List[D
         "--json",
         "--tags=podvault.schema:1",
     ]
+    if include_incomplete:
+        args.append("--incomplete")
     if project:
         args.append("--tags=podvault.project:{}".format(validate_project_name(project)))
     result = runner.run(args)
@@ -238,6 +244,79 @@ class SnapshotService:
             "podvault_snapshot_id": stable_id,
             "previous_kopia_manifest_id": snapshot["id"],
             "kopia_manifest_id": current["id"],
+        }
+
+    def delete_project(
+        self,
+        project: str,
+        snapshots: Optional[List[Dict[str, Any]]] = None,
+        show_progress: bool = True,
+        run_maintenance: bool = True,
+    ) -> Dict[str, Any]:
+        selected = list(snapshots) if snapshots is not None else list_snapshots(
+            self.runner, project, include_incomplete=True
+        )
+        manifest_ids = [str(item.get("id") or "") for item in selected]
+        if any(not manifest_id for manifest_id in manifest_ids):
+            raise VerificationError("Kopia returned a snapshot without a manifest ID")
+
+        for index, manifest_id in enumerate(manifest_ids, start=1):
+            self.console.info(
+                "Deleting Kopia snapshot {}/{}...".format(index, len(manifest_ids))
+            )
+            self.runner.run(
+                ["--no-progress", "snapshot", "delete", manifest_id, "--delete"]
+            )
+
+        remaining = list_snapshots(self.runner, project, include_incomplete=True)
+        if remaining:
+            raise VerificationError(
+                "Kopia deletion left {} snapshot(s) for project {}".format(
+                    len(remaining), project
+                )
+            )
+
+        if run_maintenance:
+            self.console.info(
+                "Running safe full Kopia maintenance to reclaim unreferenced storage..."
+            )
+            try:
+                args = [
+                    "--progress" if show_progress else "--no-progress",
+                    "maintenance",
+                    "run",
+                    "--full",
+                ]
+                if show_progress:
+                    self.runner.run_streaming(args)
+                else:
+                    self.runner.run(args)
+                maintenance = {
+                    "status": "completed",
+                    "safety": "full",
+                    "note": "Kopia safety windows may defer physical blob reclamation.",
+                }
+            except KopiaCommandError as exc:
+                maintenance = {
+                    "status": "failed",
+                    "safety": "full",
+                    "error": str(exc),
+                    "note": "Snapshots are deleted, but unreferenced storage may remain until full maintenance succeeds.",
+                }
+        else:
+            maintenance = {
+                "status": "skipped",
+                "note": "Unreferenced storage remains until full Kopia maintenance runs.",
+            }
+
+        return {
+            "status": "success",
+            "operation": "delete",
+            "engine": "kopia",
+            "project": project,
+            "deleted_snapshot_count": len(manifest_ids),
+            "deleted_kopia_manifest_ids": manifest_ids,
+            "maintenance": maintenance,
         }
 
 

@@ -3,6 +3,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Iterable, Optional
 
 from .errors import DestinationConflictError, SafetyError
@@ -131,3 +132,23 @@ def validate_destination(path_value: str) -> Path:
         else:
             raise DestinationConflictError("destination is not empty: {}".format(path))
     return path
+
+
+def validate_relative_path(path_value: Optional[str]) -> str:
+    """Return a normalized project-relative POSIX path.
+
+    Snapshot paths are remote POSIX paths regardless of the host running the
+    CLI. An empty value or ``.`` selects the snapshot root.
+    """
+    value = path_value or ""
+    if not value or value == ".":
+        return ""
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise SafetyError("snapshot path may not contain control characters")
+    candidate = PurePosixPath(value)
+    if candidate.is_absolute():
+        raise SafetyError("snapshot path must be relative to the project root")
+    if ".." in candidate.parts:
+        raise SafetyError("snapshot path may not contain '..' traversal")
+    normalized = str(candidate)
+    return "" if normalized == "." else normalized

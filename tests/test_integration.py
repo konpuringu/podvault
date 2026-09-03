@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from podvault.cli import main
+from podvault.config import ConfigStore
 
 
 KOPIA = os.environ.get("PODVAULT_KOPIA") or shutil.which("kopia")
@@ -33,6 +34,9 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
         (self.source / "unicodé.txt").write_text("snowman ☃", encoding="utf-8")
         (self.source / "excluded.tmp").write_text("not backed up", encoding="utf-8")
         (self.source / "model-link").symlink_to("file with spaces.txt")
+        selected = self.source / "checkpoints" / "run-42"
+        selected.mkdir(parents=True)
+        (selected / "model.bin").write_bytes(b"checkpoint-data")
         self.environment = mock.patch.dict(
             os.environ,
             {
@@ -122,6 +126,43 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
         self.assertEqual(len(snapshots), 2)
         self.assertEqual({item["project"] for item in snapshots}, {"newlm"})
 
+        code, output, error = self.call(
+            self.config2,
+            "tree",
+            "newlm",
+            "--path",
+            "checkpoints",
+            "--recursive",
+            json_mode=True,
+        )
+        self.assertEqual(code, 0, error)
+        tree = json.loads(output)
+        self.assertEqual(tree["path"], "checkpoints")
+        self.assertEqual(
+            [item["path"] for item in tree["entries"]],
+            ["checkpoints/run-42", "checkpoints/run-42/model.bin"],
+        )
+
+        selective_destination = self.root / "selected-run"
+        code, output, error = self.call(
+            self.config2,
+            "restore",
+            "newlm",
+            "--path",
+            "checkpoints/run-42",
+            "--to",
+            str(selective_destination),
+            "--no-progress",
+            json_mode=True,
+        )
+        self.assertEqual(code, 0, error)
+        selective = json.loads(output)
+        self.assertTrue(selective["selective"])
+        self.assertEqual(
+            (selective_destination / "model.bin").read_bytes(), b"checkpoint-data"
+        )
+        self.assertIsNone(ConfigStore(self.config2).get_project("newlm"))
+
         destination = self.root / "restored"
         destination.mkdir()
         code, output, error = self.call(
@@ -135,7 +176,7 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, error)
         restored = json.loads(output)
-        self.assertEqual(restored["restored_summary"]["files"], 4)
+        self.assertEqual(restored["restored_summary"]["files"], 5)
         self.assertEqual((destination / "file with spaces.txt").read_text(), "version two")
         self.assertFalse((destination / "excluded.tmp").exists())
         self.assertTrue((destination / "model-link").is_symlink())
@@ -146,6 +187,25 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(code, 6)
         self.assertIn("not empty", error)
+
+        code, output, error = self.call(
+            self.config2,
+            "delete",
+            "newlm",
+            "--yes",
+            json_mode=True,
+        )
+        self.assertEqual(code, 0, error)
+        deleted = json.loads(output)
+        self.assertEqual(deleted["deleted_snapshot_count"], 2)
+        self.assertEqual(deleted["maintenance"]["status"], "completed")
+        self.assertFalse(deleted["local_directory_deleted"])
+        self.assertTrue((destination / "file with spaces.txt").exists())
+        self.assertIsNone(ConfigStore(self.config2).get_project("newlm"))
+
+        code, output, error = self.call(self.config2, "list", "newlm", json_mode=True)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(output)["count"], 0)
 
     def test_dangerous_source_exit_status(self):
         code, _, _ = self.call(self.config1, "save", "/", "--name", "root")
