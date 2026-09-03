@@ -1,13 +1,16 @@
-"""Azure container SAS parsing and secure Kopia token creation."""
+"""Azure container SAS parsing, metadata access, and Kopia token creation."""
 
 import base64
 import json
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Set
-from urllib.parse import parse_qs, unquote, urlsplit
+from typing import Any, Dict, List, Optional, Set
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
-from .errors import CredentialError
+from .errors import AzureStorageError, CredentialError
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,27 @@ class AzureSAS:
                     ", ".join(sorted(missing))
                 )
             )
+
+    def require_azcopy_permissions(self, write: bool) -> None:
+        required = {"r", "l"}
+        if write:
+            required.update({"c", "w"})
+        missing = required - self.permissions
+        if missing:
+            raise CredentialError(
+                "Azure container SAS is missing permission(s) required by AzCopy: {}".format(
+                    ", ".join(sorted(missing))
+                )
+            )
+
+    def blob_url(self, blob_path: str, wildcard: bool = False) -> str:
+        parsed = urlsplit(self.url)
+        safe = "/" + ("*" if wildcard else "")
+        encoded = quote(blob_path.strip("/"), safe=safe)
+        path = parsed.path.rstrip("/")
+        if encoded:
+            path += "/" + encoded
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
         if self.expires_at is None:
@@ -120,3 +144,105 @@ def parse_sas_url(value: str) -> AzureSAS:
     if result.is_expired():
         raise CredentialError("Azure SAS has expired")
     return result
+
+
+class AzureBlobClient:
+    """Minimal Azure Blob REST client for Podvault's small JSON control files."""
+
+    def __init__(self, sas: AzureSAS, timeout: int = 60):
+        self.sas = sas
+        self.timeout = timeout
+
+    @staticmethod
+    def _headers() -> Dict[str, str]:
+        return {"x-ms-version": "2023-11-03"}
+
+    def put_json(self, blob_path: str, value: Dict[str, Any]) -> None:
+        body = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        headers = self._headers()
+        headers.update(
+            {
+                "Content-Type": "application/json",
+                "x-ms-blob-type": "BlockBlob",
+            }
+        )
+        request = Request(
+            self.sas.blob_url(blob_path), data=body, headers=headers, method="PUT"
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                response.read()
+        except (HTTPError, URLError, OSError) as exc:
+            raise AzureStorageError(
+                "unable to write Azure project metadata at {}: {}".format(blob_path, exc)
+            ) from exc
+
+    def get_json(self, blob_path: str, missing_ok: bool = False) -> Optional[Dict[str, Any]]:
+        request = Request(self.sas.blob_url(blob_path), headers=self._headers(), method="GET")
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read()
+        except HTTPError as exc:
+            if missing_ok and exc.code == 404:
+                return None
+            raise AzureStorageError(
+                "unable to read Azure project metadata at {}: HTTP {}".format(
+                    blob_path, exc.code
+                )
+            ) from exc
+        except (URLError, OSError) as exc:
+            raise AzureStorageError(
+                "unable to read Azure project metadata at {}: {}".format(blob_path, exc)
+            ) from exc
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise AzureStorageError(
+                "Azure project metadata is invalid JSON: {}".format(blob_path)
+            ) from exc
+        if not isinstance(value, dict):
+            raise AzureStorageError(
+                "Azure project metadata must be an object: {}".format(blob_path)
+            )
+        return value
+
+    def list_blobs(self, prefix: str) -> List[Dict[str, Any]]:
+        parsed = urlsplit(self.sas.url)
+        result: List[Dict[str, Any]] = []
+        marker = ""
+        while True:
+            query = parsed.query + "&restype=container&comp=list&prefix=" + quote(
+                prefix, safe="/"
+            )
+            if marker:
+                query += "&marker=" + quote(marker, safe="")
+            url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+            request = Request(url, headers=self._headers(), method="GET")
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    raw = response.read()
+            except HTTPError as exc:
+                raise AzureStorageError(
+                    "unable to list Azure blobs: HTTP {}".format(exc.code)
+                ) from exc
+            except (URLError, OSError) as exc:
+                raise AzureStorageError("unable to list Azure blobs: {}".format(exc)) from exc
+            try:
+                root = ET.fromstring(raw)
+            except ET.ParseError as exc:
+                raise AzureStorageError("Azure blob listing returned invalid XML") from exc
+            for item in root.findall("./Blobs/Blob"):
+                name = item.findtext("Name")
+                if not name:
+                    continue
+                length = item.findtext("./Properties/Content-Length")
+                result.append(
+                    {
+                        "name": name,
+                        "size": int(length) if length and length.isdigit() else None,
+                    }
+                )
+            marker = root.findtext("NextMarker") or ""
+            if not marker:
+                break
+        return result

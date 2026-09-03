@@ -1,71 +1,65 @@
 # Fresh-pod disaster recovery
 
-This procedure assumes the previous pod and all of its local files are gone.
+This procedure assumes the previous pod and all local Podvault state are gone.
 
 ## What must exist outside the old pod
 
 - The Azure storage account and Blob container.
-- A valid HTTPS container SAS URL, or authority to generate a replacement.
-- The original Kopia repository password.
-- The Podvault wheel/bootstrap files, or another trusted copy of this source.
+- A valid HTTPS container SAS URL, or authority to generate one.
 - The project name, for example `newlm`.
+- For a Kopia project, the original repository password.
+- A trusted Podvault release or source checkout.
 
-The old source path, hostname, Podvault config, and receipt are useful but not
-required. A replacement SAS may have a different signature and expiry as long
-as it points to the same account and container. A replacement repository
-password will not substitute for the original encryption password.
+The remote project record lets Podvault 0.2 discover the engine and current
+AzCopy generation. Projects created with 0.1 have no record and default to
+Kopia. The old source path, hostname, local configuration, and receipt are not
+required.
 
 ## Recovery checklist
 
-1. Create a pod with enough free disk space for the restored project plus
-   temporary overhead.
-2. Install the pinned Kopia and Podvault releases as described in
+1. Create a pod with enough free disk space for the restored project and its
+   staging directory.
+2. Install Podvault, Kopia, and AzCopy as described in
    [bootstrap.md](bootstrap.md).
-3. Inject the two secrets without putting them on a command line:
+3. Inject the SAS without putting it on a Podvault command line:
 
    ```bash
    export PODVAULT_AZURE_SAS_URL='https://ACCOUNT.blob.core.windows.net/CONTAINER?...'
+   ```
+
+   If the project uses Kopia, also inject the original repository password:
+
+   ```bash
    export PODVAULT_REPOSITORY_PASSWORD='original-repository-password'
    ```
 
-4. Confirm access without allowing repository creation:
+4. Discover and restore:
 
    ```bash
-   podvault repository connect azure
-   podvault repository status
    podvault list newlm
-   ```
-
-5. Restore. The default is the latest snapshot and `/workspace/<project>`:
-
-   ```bash
    podvault restore newlm
    ```
 
-   To recover a particular version or location:
+   To recover another generation or location:
 
    ```bash
-   podvault restore newlm --snapshot PODVAULT_OR_KOPIA_ID --to /workspace/newlm-old
+   podvault restore newlm --snapshot PODVAULT_SNAPSHOT_ID --to /workspace/newlm-old
    ```
 
-6. Read the restore receipt, inspect key files, and run the project's own
-   integrity checks before resuming work.
+5. Review the receipt, inspect key files, and run the project's own integrity
+   checks before resuming work.
 
-Never run `save` when intending only to recover from an uncertain container:
-`restore`, `list`, `verify`, and `repository connect` do not initialize an empty
-repository.
+Never run `save` when intending only to inspect an uncertain container.
 
 ## Expired SAS
 
 Generate a new container SAS for the same storage account and container. A
-read/list SAS is sufficient for recovery. Replace the pod environment secret
-and reconnect. The encrypted repository contents do not need to be copied or
-rewritten.
+read/list SAS is sufficient for recovery. Replace the pod environment secret;
+the stored data does not need to be rewritten.
 
-An authentication failure with a valid SAS most often means the scope,
-permissions, start/expiry time, container, or storage account is wrong. Compare
-the non-secret account/container shown by `podvault doctor`; do not publish the
-URL while troubleshooting.
+An authentication failure with a valid SAS usually means the scope,
+permissions, start/expiry time, container, or account is wrong. Do not publish
+the SAS URL while troubleshooting.
 
 ## Interrupted restore
 
@@ -76,15 +70,27 @@ An interruption leaves entries beside the requested destination:
 .newlm.podvault-restore-state-<random>.json
 ```
 
-The JSON marker identifies the project, selected Kopia manifest/root object,
-destination, and staging path. Preserve it while investigating. Podvault 0.1
-does not resume or merge partial restores. Move the partial tree to a diagnostic
-location or remove it only after inspection, ensure the final destination is
-absent or empty, then rerun the restore.
+The JSON marker identifies the engine, project, snapshot, destination, and
+staging path. Podvault does not merge a partial tree into a later restore. Keep
+the files while investigating, then move or remove the partial tree only after
+inspection and rerun the restore into an absent or empty destination.
+
+AzCopy also keeps job plan files in Podvault's protected state directory. They
+can help diagnose or manually resume a transfer while the pod still exists,
+but they are not expected to survive deletion of an ephemeral pod.
 
 ## No Podvault executable available
 
-The data remains an ordinary Kopia repository. Follow
-[direct-kopia-recovery.md](direct-kopia-recovery.md) to create a Kopia
-connection without exposing the SAS in the process list, list the Podvault tags,
-and restore the selected root object.
+For Kopia projects, follow
+[direct-kopia-recovery.md](direct-kopia-recovery.md).
+
+For AzCopy projects, the direct data prefix is recorded in:
+
+```text
+.podvault/projects/PROJECT/project.json
+.podvault/azcopy/v1/projects/PROJECT/snapshots/SNAPSHOT/manifest.json
+```
+
+Download the selected snapshot's `data/` virtual directory recursively with
+AzCopy, enabling symbolic-link and POSIX-property preservation. Verify the
+result against the manifest summary before using it.

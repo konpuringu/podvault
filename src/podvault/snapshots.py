@@ -178,6 +178,7 @@ class SnapshotService:
         receipt = {
             "status": "success",
             "safe_to_terminate": True,
+            "engine": "kopia",
             "application_quiescence_established": False,
             "source": str(source),
             "canonical_source": canonical_source(project),
@@ -211,6 +212,7 @@ class SnapshotService:
         )
         return {
             "status": "success",
+            "engine": "kopia",
             "project": project,
             "podvault_snapshot_id": _tag(snapshot, "podvault.snapshot"),
             "kopia_manifest_id": snapshot["id"],
@@ -230,6 +232,7 @@ class SnapshotService:
             current = select_snapshot(list_snapshots(self.runner, project), stable_id)
         return {
             "status": "success",
+            "engine": "kopia",
             "project": project,
             "label": label,
             "podvault_snapshot_id": stable_id,
@@ -241,6 +244,7 @@ class SnapshotService:
 def snapshot_view(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     root = snapshot.get("rootEntry") or {}
     return {
+        "engine": "kopia",
         "project": _tag(snapshot, "podvault.project"),
         "podvault_snapshot_id": _tag(snapshot, "podvault.snapshot"),
         "kopia_manifest_id": snapshot.get("id"),

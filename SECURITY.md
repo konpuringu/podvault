@@ -10,22 +10,25 @@ redacted logs.
 
 ## Secrets
 
-Podvault needs two independent credentials:
+All projects need an Azure container SAS. Kopia projects need a second
+credential:
 
 - The Azure container SAS authorizes storage access and can be rotated.
-- The Kopia repository password encrypts repository data and generally cannot
+- The Kopia repository password encrypts Kopia data and generally cannot
   be recovered or replaced without the old password.
 
-Store both in a password manager outside the pod. A RunPod secret exposed as
+Store required credentials in a password manager outside the pod. A RunPod secret exposed as
 `PODVAULT_AZURE_SAS_URL` or `PODVAULT_REPOSITORY_PASSWORD` is preferred for
 repeatable fresh-pod recovery. `KOPIA_PASSWORD` is accepted as a compatibility
 fallback.
 
-Podvault does not accept a literal SAS or password flag. SAS connection material
-is sent to Kopia over standard input, repository passwords are supplied through
-the child process environment, subprocesses never use a shell, and command
-errors are redacted. Local credential and connection files must be mode 0600;
-directories are mode 0700.
+Podvault does not accept a literal SAS or password flag. Kopia connection
+material is sent over standard input and repository passwords are supplied
+through the child environment. AzCopy v10 requires a SAS in its source or
+destination URL, so an AzCopy child process's arguments transiently expose the
+SAS to root and other sufficiently privileged processes on the pod. Podvault
+never invokes a shell and redacts command output and errors. Local credential
+and connection files must be mode 0600; directories are mode 0700.
 
 Environment secrets and local mode bits do not protect against root or another
 process running as the same Unix user. Do not share a pod account with untrusted
@@ -35,22 +38,24 @@ the Podvault config directory to a project snapshot.
 ## SAS scope
 
 Use a dedicated container, HTTPS-only transport, the shortest practical expiry,
-and minimum permissions. Saving needs read, write, and list; read-only recovery
-needs read and list. Podvault requires a container SAS (`sr=c`) because Kopia
-stores a repository as many blobs. An account-wide SAS is broader than needed.
+and minimum permissions. Saving needs read, create, write, and list; read-only
+recovery needs read and list. Podvault requires a container SAS (`sr=c`)
+because both engines store many blobs. An account-wide SAS is broader than
+needed.
 
 Rotating a stored SAS removes the local, reproducible Kopia connection file so
 the next command reconnects with the new credential. It never modifies the
 remote repository. An environment SAS always overrides the stored value.
 
-## Repository safety
+## Storage safety
 
-Kopia performs client-side repository encryption and deduplication. Podvault
-does not weaken or replace the format. Ordinary Podvault commands disable
-Kopia's automatic maintenance and update checks, and 0.1 contains no delete or
-prune operation. This prevents a routine save from unexpectedly expanding into
-a destructive maintenance task, but means an operator must plan deliberate
-repository maintenance separately.
+Kopia performs client-side repository encryption and deduplication. AzCopy
+generations use Azure's server-side encryption and are directly readable to a
+principal with Blob access; they are not client-side encrypted by Podvault.
+
+Podvault 0.2 has no delete or prune operation. Kopia history is deduplicated,
+but every AzCopy save adds a complete generation. Operators must plan storage
+monitoring and deliberate cleanup separately.
 
 `SAFE TO TERMINATE: YES` means the snapshot command and required structural
 verification succeeded. It does not mean an application was stopped cleanly,
@@ -65,6 +70,7 @@ Before relying on Podvault:
    pod.
 2. Save a test project.
 3. Create a fresh pod with no copied config.
-4. Reinstall Podvault and Kopia and restore with only those secrets.
+4. Reinstall Podvault and the selected transfer engine and restore with only
+   the required secrets.
 5. Open representative files and, for high-value data, run a 100% content
    verification or a complete test restore.

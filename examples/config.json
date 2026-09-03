@@ -4,6 +4,7 @@
   },
   "projects": {
     "newlm": {
+      "engine": "kopia",
       "path": "/workspace/newlm"
     }
   },

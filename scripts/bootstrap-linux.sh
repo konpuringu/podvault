@@ -2,12 +2,13 @@
 set -eu
 
 KOPIA_VERSION=0.23.1
+AZCOPY_VERSION=10.32.6
 INSTALL_PREFIX=${PODVAULT_INSTALL_PREFIX:-"$HOME/.local"}
 DATA_ROOT=${PODVAULT_INSTALL_DATA_ROOT:-"$HOME/.local/share/podvault"}
 WHEEL_PATH=${1:-}
 
 if [ -z "$WHEEL_PATH" ] || [ ! -f "$WHEEL_PATH" ]; then
-  echo "usage: $0 /path/to/podvault-0.1.1-py3-none-any.whl" >&2
+  echo "usage: $0 /path/to/podvault-0.2.0-py3-none-any.whl" >&2
   exit 2
 fi
 
@@ -15,10 +16,14 @@ case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64)
     KOPIA_ARCH=x64
     KOPIA_SHA256=416d0f84a3dbb321a8b2d8f0997b1a0a6e915babe79ee76fa6e4d2bd1e1c5178
+    AZCOPY_ARCH=amd64
+    AZCOPY_SHA256=6538f7fb9ec6e4d159e44a1612ca7eee24fe7a822065a3dcbc664ef30fe85d16
     ;;
   Linux:aarch64|Linux:arm64)
     KOPIA_ARCH=arm64
     KOPIA_SHA256=a4ffbc019e0b0f932e2632054e73ec521dc1e80172a00095369c53ecf4e5a6cb
+    AZCOPY_ARCH=arm64
+    AZCOPY_SHA256=69acdbdc1450f06ba3d4f07bea23508f43dd5f82096cf59b15fdf73f0dfda35d
     ;;
   *)
     echo "unsupported platform: $(uname -s) $(uname -m)" >&2
@@ -43,15 +48,26 @@ curl --fail --location --proto '=https' --tlsv1.2 "$DOWNLOAD_URL" \
 printf '%s  %s\n' "$KOPIA_SHA256" "$TEMP_ROOT/$ARCHIVE" | sha256sum --check --status
 tar -xzf "$TEMP_ROOT/$ARCHIVE" -C "$TEMP_ROOT"
 
+AZCOPY_ARCHIVE="azcopy_linux_${AZCOPY_ARCH}_${AZCOPY_VERSION}.tar.gz"
+AZCOPY_DOWNLOAD_URL="https://github.com/Azure/azure-storage-azcopy/releases/download/v${AZCOPY_VERSION}/${AZCOPY_ARCHIVE}"
+curl --fail --location --proto '=https' --tlsv1.2 "$AZCOPY_DOWNLOAD_URL" \
+  --output "$TEMP_ROOT/$AZCOPY_ARCHIVE"
+printf '%s  %s\n' "$AZCOPY_SHA256" "$TEMP_ROOT/$AZCOPY_ARCHIVE" | sha256sum --check --status
+tar -xzf "$TEMP_ROOT/$AZCOPY_ARCHIVE" -C "$TEMP_ROOT"
+
 mkdir -p "$INSTALL_PREFIX/bin" "$DATA_ROOT"
 install -m 0755 \
   "$TEMP_ROOT/kopia-${KOPIA_VERSION}-linux-${KOPIA_ARCH}/kopia" \
   "$INSTALL_PREFIX/bin/kopia"
+install -m 0755 \
+  "$TEMP_ROOT/azcopy_linux_${AZCOPY_ARCH}_${AZCOPY_VERSION}/azcopy" \
+  "$INSTALL_PREFIX/bin/azcopy"
 
 python3 -m venv "$DATA_ROOT/venv"
 "$DATA_ROOT/venv/bin/python" -m pip install --disable-pip-version-check "$WHEEL_PATH"
 ln -sfn "$DATA_ROOT/venv/bin/podvault" "$INSTALL_PREFIX/bin/podvault"
 
 "$INSTALL_PREFIX/bin/kopia" --version
+"$INSTALL_PREFIX/bin/azcopy" --version
 "$INSTALL_PREFIX/bin/podvault" --version
 echo "Installed. Add $INSTALL_PREFIX/bin to PATH if it is not already present."

@@ -1,236 +1,290 @@
 # Podvault
 
-Podvault is a small, safety-focused command-line wrapper around
-[Kopia](https://kopia.io/). It incrementally saves named project directories
-from ephemeral Linux GPU pods to Azure Blob Storage, verifies each save, and
-restores through a temporary directory before putting files in place.
+Podvault saves named project directories from ephemeral Linux GPU pods to
+Azure Blob Storage and restores them safely through a temporary directory. A
+project chooses one storage engine on its first save:
 
-Podvault does not define a backup format or run a server. The repository is an
-ordinary, encrypted Kopia repository in your Azure container, so it remains
-accessible with Kopia itself.
+- **Kopia** (default): encrypted, compressed, deduplicated, incremental
+  snapshots and inexpensive history.
+- **AzCopy**: direct, high-concurrency Azure transfers optimized for restore
+  throughput. Every save is a complete immutable generation.
 
-> **Status:** 0.1.1 is an alpha release. Test the workflow with non-critical
-> data before making it your only recovery path.
+The engine is stored in both local configuration and a small remote project
+record. Later commands need only the project name; Podvault refuses to open an
+existing project with the other engine.
 
-## The shortest complete workflow
+> **Status:** 0.2.0 is an alpha release. Test the complete save/restore workflow
+> with non-critical data before making it your only recovery path.
 
-You need two secrets:
+## Choose an engine
 
-1. An **HTTPS, container-scoped Azure SAS URL**, for example
-   `https://ACCOUNT.blob.core.windows.net/CONTAINER?...`. It must include read,
-   write, and list permissions for saving (`rwl`); read and list are sufficient
-   for a read-only restore. Podvault rejects an individual-blob SAS because a
-   Kopia repository consists of many blobs.
-2. A **Kopia repository password**. This is independent of the SAS and encrypts
-   the repository. Losing it can make every snapshot unrecoverable.
+Use Kopia when storage efficiency, client-side encryption, and multiple
+snapshots matter most. Use AzCopy when minimizing idle GPU time during a full
+restore matters more than transfer and Blob-storage efficiency.
+
+| | Kopia | AzCopy |
+|---|---|---|
+| First save | `--engine kopia` or omit | `--engine azcopy` |
+| Later saves/restores | project name only | project name only |
+| Save format | incremental chunks | complete immutable file-tree generation |
+| Encryption | Kopia client-side encryption | Azure server-side encryption |
+| Compression/deduplication | yes | no |
+| Restore transfer | decrypts and reconstructs chunks | direct Azure-to-filesystem copy |
+| `.podvaultignore` | yes | no; the complete tree is transferred |
+| Remote history | deduplicated snapshots | full generations; storage grows by the project size per save |
+| Required secret | SAS + repository password | SAS only |
+
+Projects created by Podvault 0.1 are treated as Kopia projects. An Azure
+container may hold both formats, but a particular project name cannot switch
+between them.
+
+## Shortest complete workflows
+
+Both engines need an HTTPS, container-scoped Azure SAS URL such as:
+
+```text
+https://ACCOUNT.blob.core.windows.net/CONTAINER?...
+```
+
+For saves, grant read, create, write, and list (`rcwl`). Restores need read and
+list (`rl`). Podvault rejects account-level, directory, and individual-blob
+SAS URLs.
+
+### Fast direct transfers with AzCopy
 
 On the first pod:
 
 ```bash
 export PODVAULT_AZURE_SAS_URL='https://ACCOUNT.blob.core.windows.net/CONTAINER?...'
-export PODVAULT_REPOSITORY_PASSWORD='a-long-random-secret-from-your-password-manager'
 
-podvault save /workspace/newlm --name newlm --dry-run
-podvault save /workspace/newlm --name newlm --description 'before terminating pod'
+podvault save /workspace/newlm --name newlm --engine azcopy --dry-run
+podvault save /workspace/newlm --name newlm --engine azcopy \
+  --description 'before terminating pod'
 ```
 
-The first real save derives the account and container from the SAS URL,
-connects to the repository, or initializes it if the container does not yet
-contain one. It remembers `newlm -> /workspace/newlm` locally. After more work:
+After more work on the same pod:
 
 ```bash
 podvault save newlm --description 'after evaluation run'
 ```
 
-Terminate the pod only when that command exits with status 0 and prints the
-exact line:
-
-```text
-SAFE TO TERMINATE: YES
-```
-
-On a fresh pod, install Podvault and Kopia, inject the same two secrets, then:
+On a fresh pod, inject the same container SAS and run:
 
 ```bash
 podvault list newlm
 podvault restore newlm
 ```
 
-With no prior local configuration, `restore newlm` reconstructs the Azure
-connection from the SAS URL, finds the stable project history, and restores to
-`/workspace/newlm`. No source path or old hostname is needed.
+The remote project record tells the fresh installation to use AzCopy and the
+restore defaults to `/workspace/newlm`.
 
-For RunPod, put the values in secrets named `PODVAULT_AZURE_SAS_URL` and
-`PODVAULT_REPOSITORY_PASSWORD` and expose them as environment variables in each
-pod. Then normal saves and restores require only the project name. If you enter
-credentials at Podvault's hidden interactive prompts instead, they are stored
-in a local mode-0600 file; that is convenient on the current pod but does not
-survive deleting it.
+### Storage-efficient snapshots with Kopia
+
+Kopia additionally needs a repository password. It is independent of the SAS
+and encrypts the repository; losing it can make every Kopia snapshot
+unrecoverable.
+
+```bash
+export PODVAULT_AZURE_SAS_URL='https://ACCOUNT.blob.core.windows.net/CONTAINER?...'
+export PODVAULT_REPOSITORY_PASSWORD='a-long-random-secret-from-your-password-manager'
+
+podvault save /workspace/newlm --name newlm --engine kopia --dry-run
+podvault save /workspace/newlm --name newlm --engine kopia \
+  --description 'before terminating pod'
+```
+
+Kopia is the default, so `--engine kopia` may be omitted. On a fresh pod:
+
+```bash
+export PODVAULT_AZURE_SAS_URL='https://ACCOUNT.blob.core.windows.net/CONTAINER?...'
+export PODVAULT_REPOSITORY_PASSWORD='the-same-repository-password'
+
+podvault list newlm
+podvault restore newlm
+```
+
+For either engine, terminate the pod only after a save exits with status 0 and
+prints:
+
+```text
+SAFE TO TERMINATE: YES
+```
 
 ## Install
 
-Requirements are Linux, Python 3.9 or newer, and Kopia 0.23.1 or newer.
-Podvault never installs or upgrades Kopia during a save or restore.
+Requirements are Linux and Python 3.9 or newer. Kopia projects require Kopia
+0.23.1 or newer; AzCopy projects require AzCopy 10.18.0 or newer.
 
-Install the release wheel:
+Install the release wheel when the transfer binaries are already available:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.1.1/podvault-0.1.1-py3-none-any.whl
-python3 -m pip install podvault-0.1.1-py3-none-any.whl
-kopia --version
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/podvault-0.2.0-py3-none-any.whl
+python3 -m pip install podvault-0.2.0-py3-none-any.whl
 podvault doctor
 ```
 
-For a fresh Linux pod, the explicit bootstrap helper installs a checksum-pinned
-Kopia binary and the supplied wheel under `~/.local`:
+The bootstrap helper installs checksum-pinned Kopia 0.23.1, AzCopy 10.32.6,
+and the supplied wheel under `~/.local`:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.1.1/bootstrap-linux.sh
-bash bootstrap-linux.sh podvault-0.1.1-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.2.0/bootstrap-linux.sh
+bash bootstrap-linux.sh podvault-0.2.0-py3-none-any.whl
 export PATH="$HOME/.local/bin:$PATH"
 podvault doctor
 ```
 
-See [docs/bootstrap.md](docs/bootstrap.md) for package-manager alternatives and
-[docs/disaster-recovery.md](docs/disaster-recovery.md) for a no-old-pod recovery
-checklist.
-
-## Azure SAS details
-
-Use a dedicated Azure Blob container when possible. Generate a **service SAS
-for the container**, restricted to HTTPS and with a useful expiry time.
-
-- Normal save: read (`r`), write (`w`), list (`l`).
-- Restore/list/verify: read (`r`), list (`l`).
-- Future repository maintenance may also need delete (`d`). Podvault 0.1 does
-  not prune or delete repository data automatically.
-
-Do not paste a SAS into a command-line option. Use an environment secret, a
-mode-0600 secret file where offered, or the hidden interactive prompt. To
-initialize explicitly instead of allowing the first save to do it:
-
-```bash
-podvault repository init azure
-```
-
-To connect to an existing repository:
-
-```bash
-podvault repository connect azure
-podvault repository status
-```
-
-When a SAS expires, replace the injected environment secret. For protected
-file-based credentials:
-
-```bash
-chmod 600 /run/secrets/new-podvault-sas
-podvault credentials update --sas-url-file /run/secrets/new-podvault-sas
-```
-
-An environment value takes precedence over the protected local credential. If
-`PODVAULT_AZURE_SAS_URL` is set, update that environment value (or restart the
-pod with the updated RunPod secret) rather than expecting a local update to
-override it.
+See [docs/bootstrap.md](docs/bootstrap.md) for alternatives and
+[docs/disaster-recovery.md](docs/disaster-recovery.md) for recovery details.
 
 ## Commands
 
 ```text
+podvault save PATH --name PROJECT [--engine kopia|azcopy] [--description TEXT]
+podvault save PROJECT [--description TEXT]
+podvault save ... --dry-run [--no-progress]
+
+podvault list [PROJECT] [--engine kopia|azcopy]
+podvault restore PROJECT [--latest | --snapshot ID] [--to PATH] [--no-progress]
+podvault restore PROJECT [--parallel N] [--durable]       # Kopia only
+podvault verify PROJECT [--latest | --snapshot ID] [--sample-percent N]
+podvault pin PROJECT [--latest | --snapshot ID] --label TEXT  # Kopia only
+
+podvault configure PATH --name PROJECT [--engine kopia|azcopy]
+podvault credentials update [--sas-url-file FILE] [--repository-password-file FILE]
 podvault repository init azure [--sas-url-file FILE] [--repository-password-file FILE]
 podvault repository connect azure [--sas-url-file FILE] [--repository-password-file FILE]
 podvault repository status
-
-podvault configure PATH --name PROJECT
-podvault save PATH --name PROJECT [--description TEXT] [--dry-run] [--no-progress]
-podvault save PROJECT [--description TEXT] [--dry-run] [--no-progress]
-podvault list [PROJECT]
-podvault restore PROJECT [--latest | --snapshot ID] [--to PATH] [--no-progress]
-podvault verify PROJECT [--latest | --snapshot ID] [--sample-percent N] [--no-progress]
-podvault pin PROJECT [--latest | --snapshot ID] --label TEXT
-podvault credentials update [--sas-url-file FILE] [--repository-password-file FILE]
 podvault doctor
 ```
 
+`repository` commands manage Kopia repositories and are unnecessary for an
+AzCopy-only workflow. The first real Kopia save can initialize an empty
+container automatically.
+
 Add global `--json` for a machine-readable final result and `--config PATH` to
-isolate all local Podvault state for a particular setup:
+isolate local Podvault state:
 
 ```bash
 podvault --json save newlm
 podvault --config /secure/podvault/config.json list newlm
 ```
 
-Live Kopia progress is enabled by default for saves, dry runs, restores, and
-verification. During a large save it reports hashing, cached logical data,
-uploaded bytes, a rolling estimated total, completion percentage, and ETA once
-Kopia has scanned enough content to estimate them. Early updates say
-`estimating...`; percentages and ETAs can move as more files are discovered and
-deduplication or upload throughput changes. Progress goes to standard error, so
-`--json` keeps standard output valid JSON. Use `--no-progress` when a quiet
-automation log is preferable.
+## Faster Kopia restores in 0.2.0
 
-The filesystem repository commands exist for development and air-gapped tests:
+Normal Kopia restores now use adaptive parallelism up to 32 and no longer
+force per-file flushes or temporary-file renames. Podvault already restores
+into an isolated staging directory, validates the resulting tree, and promotes
+the directory only after success, so partially restored data is never exposed
+at the requested destination.
+
+Override concurrency when benchmarking a particular pod:
 
 ```bash
-podvault repository init filesystem /srv/test-repository
-podvault repository connect filesystem /srv/test-repository
+podvault restore newlm --parallel 16
+podvault restore newlm --parallel 32
 ```
 
-## Saves and verification
+`--durable` restores the conservative 0.1 behavior (`--flush-files` and
+`--write-files-atomically`). It is substantially slower on some filesystems
+and is intended only when surviving a host power failure during the final
+filesystem writeback is more important than restore time.
 
-`save --dry-run` delegates the scan to Kopia and shows included and excluded
-examples, logical sizes, size buckets (which expose unusually large content),
-and an upload-time estimate. It does not create a snapshot. On an entirely new,
-empty container it may initialize the Kopia repository and ignore policy so the
-estimate uses the same rules as the subsequent save.
+Receipts separately report repository verification, data transfer, final tree
+scan, and total elapsed time.
 
-A real save uses a stable virtual source, uploads incrementally, checks that the
-snapshot contains no failed entries, and runs structural verification. The
-receipt records the stable Podvault snapshot ID, current Kopia manifest and
-root-object IDs, versions, timestamps, source metadata, summary, warnings, and
-verification result. Receipts contain no SAS or repository password.
+## AzCopy format and safety model
 
-Verification levels are deliberately distinct:
+AzCopy data is stored under:
 
-- Every save performs **structural verification**: referenced repository
-  objects must be present and readable as repository structures.
-- `podvault verify newlm --sample-percent 10` additionally downloads and
-  validates content for a sample of files. `100` checks all file contents and
-  can incur Azure egress.
-- A restore to a separate disk or machine is the strongest migration test. It
-  also needs full destination space and may incur egress.
+```text
+.podvault/azcopy/v1/projects/PROJECT/snapshots/SNAPSHOT/data/...
+```
+
+Each save uses a new snapshot ID. Podvault uploads the complete tree, writes an
+immutable manifest, then atomically replaces the small remote project record
+that points to the current generation. If an upload fails, the old pointer is
+unchanged and the command never prints `SAFE TO TERMINATE: YES`.
+
+AzCopy uploads Content-MD5 values. Restores ask AzCopy to fail on a mismatched
+MD5, then Podvault compares logical byte, file, directory, and symbolic-link
+counts against the committed manifest before renaming the staging directory
+into place. POSIX metadata and symbolic links are preserved using AzCopy's Blob
+metadata support.
+
+AzCopy generations are not compressed or deduplicated and Podvault does not
+prune them in 0.2.0. Each successful save therefore adds approximately one
+complete project tree to Azure storage. Use a dedicated container and monitor
+its size.
+
+AzCopy v10 accepts SAS credentials only as part of its Azure URL. Podvault
+redacts the SAS from console output and errors, but while an AzCopy child
+process is running the URL can be visible to other sufficiently privileged
+processes on the same pod through the process table. Use a dedicated pod,
+least-privilege container SAS, HTTPS-only access, and a bounded expiry.
+
+Tune AzCopy with its supported environment variables when necessary. Podvault
+defaults `AZCOPY_CONCURRENCY_VALUE=AUTO`, disables redundant per-file download
+temporary paths because it already stages the whole tree, and keeps AzCopy job
+plans and error-only logs in Podvault's protected state directory. Explicit
+environment values override these defaults.
+
+## Kopia saves and verification
+
+Kopia snapshots use a stable virtual source and Podvault tags. Every save runs
+structural verification and records stable Podvault snapshot, Kopia manifest,
+and root-object IDs. Kopia owns encryption, compression, deduplication,
+content-defined chunking, and retention pins.
+
+`podvault verify newlm --sample-percent 10` downloads and validates a sample of
+Kopia file content; `100` checks all file content. AzCopy projects validate
+Content-MD5 during restore and support only structural remote verification.
+
+`podvault pin` is Kopia-only. AzCopy generations are already immutable and
+retained until removed manually.
 
 Podvault cannot prove that a training process is quiescent. It warns about
 recently modified and incomplete-looking files but does not stop jobs or flush
 application-level checkpoint state.
 
-All Podvault 0.1 snapshots receive a system retention pin. `podvault pin` adds a
-human label. There is intentionally no pruning command in this release, so
-repository usage will grow until maintenance is performed deliberately with
-Kopia.
+## Restore behavior
 
-## Restores
+Both engines refuse a file, symbolic-link destination, or nonempty directory.
+Both restore into a random temporary sibling directory, compare the restored
+tree with committed metadata, and only then rename it into place.
 
-Podvault first structurally verifies the selected snapshot, restores it into a
-random temporary sibling directory, compares restored file/directory/symlink
-counts and logical byte size with the snapshot summary, flushes restored files,
-and only then renames the directory into place.
+An interrupted or failed restore preserves the staging directory and a sibling
+`.podvault-restore-state-*.json` marker. See the disaster-recovery guide before
+removing them.
 
-It refuses files, symbolic-link destinations, or nonempty directories. It has
-no overwrite mode. An interrupted or failed restore preserves both the staging
-directory and a sibling `.podvault-restore-state-*.json` recovery marker; see
-the disaster-recovery guide before cleaning those up.
+Live progress is enabled by default and sent to standard error in JSON mode.
+Use `--no-progress` for quiet automation. The final receipt contains no SAS or
+repository password.
 
 ## `.podvaultignore`
 
-Podvault registers `.podvaultignore` as a Kopia dot-ignore file. Rules use
-Kopia's pattern syntax: one rule per line, `#` comments, `!` negation, `*`,
-`**`, `?`, character ranges, and a leading `/` for the current ignore-file
-root. Ignore files may appear at the project root or below it.
+`.podvaultignore` applies only to Kopia projects. Rules use Kopia's pattern
+syntax: one rule per line, `#` comments, `!` negation, `*`, `**`, `?`, character
+ranges, and a leading `/` for the current ignore-file root.
 
-Start by copying [examples/podvaultignore](examples/podvaultignore) to your
-project as `.podvaultignore`, edit it carefully, and always inspect a dry run.
-There are no implicit ML exclusions: a broad checkpoint rule can exclude the
-only state you needed to recover.
+AzCopy projects intentionally transfer the entire source tree. Remove caches
+or generated data from the source before saving if they should not be stored.
+
+## Credentials
+
+Do not put a SAS directly in a Podvault command. Prefer a RunPod secret exposed
+as `PODVAULT_AZURE_SAS_URL`, a mode-0600 secret file where offered, or the
+hidden interactive prompt. For Kopia, expose the repository password as
+`PODVAULT_REPOSITORY_PASSWORD`.
+
+When a SAS expires, replace the environment secret. For protected local
+credentials:
+
+```bash
+chmod 600 /run/secrets/new-podvault-sas
+podvault credentials update --sas-url-file /run/secrets/new-podvault-sas
+```
+
+An environment value takes precedence over a protected local credential.
 
 ## Local files
 
@@ -238,12 +292,13 @@ Default locations follow XDG conventions:
 
 - Config: `~/.config/podvault/config.json`
 - Protected credentials: `~/.config/podvault/credentials.json`
-- Kopia connection config: `~/.config/podvault/kopia.repository.config`
-- Cache: `~/.cache/podvault/kopia/`
-- Receipts/state: `~/.local/state/podvault/`
+- Kopia connection: `~/.config/podvault/kopia.repository.config`
+- Kopia cache: `~/.cache/podvault/kopia/`
+- Receipts and AzCopy job state: `~/.local/state/podvault/`
 
-The source path validator refuses broad roots and refuses a project that would
-contain Podvault's config, credentials, cache, state, or a local test repository.
+The source validator refuses broad roots and a project that would contain
+Podvault's configuration, credentials, cache, state, or a local test
+repository.
 
 ## Development
 
@@ -252,8 +307,8 @@ python3 -m unittest discover -s tests -v
 python3 setup.py sdist bdist_wheel
 ```
 
-The default automated integration suite creates a local filesystem-backed
-Kopia repository and requires no Azure account. The explicitly opt-in Azure
-procedure is documented in [docs/azure-integration-test.md](docs/azure-integration-test.md).
+The automated Kopia integration test uses a local filesystem repository. The
+Azure integration checklist is in
+[docs/azure-integration-test.md](docs/azure-integration-test.md).
 
 Podvault is licensed under Apache-2.0. See [LICENSE](LICENSE).
