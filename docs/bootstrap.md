@@ -63,6 +63,9 @@ export PODVAULT_AZURE_SAS_URL='https://ACCOUNT.blob.core.windows.net/CONTAINER?.
 podvault restore newlm
 ```
 
+Use `podvault tree newlm` to inspect the saved directory structure first, or
+`podvault restore newlm --path DIR --to PATH` to retrieve one subtree.
+
 Kopia projects also need their original repository password:
 
 ```bash

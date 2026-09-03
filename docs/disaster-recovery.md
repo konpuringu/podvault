@@ -46,6 +46,17 @@ required.
    podvault restore newlm --snapshot PODVAULT_SNAPSHOT_ID --to /workspace/newlm-old
    ```
 
+   When only one subtree is needed, inspect it first and restore only that
+   directory:
+
+   ```bash
+   podvault tree newlm --path checkpoints --recursive
+   podvault restore newlm --path checkpoints/run-42 --to /workspace/run-42
+   ```
+
+   Selective restore requires an explicit `--to`. It uses the same credentials
+   as a full restore and does not change the remembered full-project path.
+
 5. Review the receipt, inspect key files, and run the project's own integrity
    checks before resuming work.
 

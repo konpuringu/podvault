@@ -61,6 +61,9 @@ class ProjectCatalog:
         self.blobs.put_json(project_record_path(project), value)
         return value
 
+    def delete(self, project: str) -> bool:
+        return self.blobs.delete_blob(project_record_path(project), missing_ok=True)
+
     def list_records(self) -> List[Dict[str, Any]]:
         suffix = "/project.json"
         result = []

@@ -83,3 +83,10 @@ class ConfigStore:
             value["engine"] = selected_engine
         self.data["projects"][name] = value
         self.save()
+
+    def remove_project(self, name: str) -> bool:
+        if name not in self.data["projects"]:
+            return False
+        del self.data["projects"][name]
+        self.save()
+        return True

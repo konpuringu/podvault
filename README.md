@@ -47,8 +47,10 @@ https://ACCOUNT.blob.core.windows.net/CONTAINER?...
 ```
 
 For saves, grant read, create, write, and list (`rcwl`). Restores need read and
-list (`rl`). Podvault rejects account-level, directory, and individual-blob
-SAS URLs.
+list (`rl`). Deletes additionally need delete (`d`); Kopia deletion and its
+maintenance pass need read, write, delete, and list (`rwld`), while AzCopy-only
+deletion needs read, delete, and list (`rdl`). Podvault rejects account-level,
+directory, and individual-blob SAS URLs.
 
 ### Fast direct transfers with AzCopy
 
@@ -144,10 +146,14 @@ podvault save PROJECT [--description TEXT]
 podvault save ... --dry-run [--no-progress]
 
 podvault list [PROJECT] [--engine kopia|azcopy]
+podvault tree PROJECT [--latest | --snapshot ID] [--path DIR] [--recursive]
 podvault restore PROJECT [--latest | --snapshot ID] [--to PATH] [--no-progress]
+podvault restore PROJECT --path DIR --to PATH
 podvault restore PROJECT [--parallel N] [--durable]       # Kopia only
 podvault verify PROJECT [--latest | --snapshot ID] [--sample-percent N]
 podvault pin PROJECT [--latest | --snapshot ID] --label TEXT  # Kopia only
+podvault delete PROJECT [--yes] [--no-progress]
+podvault delete PROJECT --no-maintenance  # Kopia: defer storage reclamation
 
 podvault configure PATH --name PROJECT [--engine kopia|azcopy]
 podvault credentials update [--sas-url-file FILE] [--repository-password-file FILE]
@@ -160,6 +166,67 @@ podvault doctor
 `repository` commands manage Kopia repositories and are unnecessary for an
 AzCopy-only workflow. The first real Kopia save can initialize an empty
 container automatically.
+
+## Browse and selectively restore
+
+Browse the latest saved tree without downloading project files:
+
+```bash
+podvault tree newlm
+podvault tree newlm --path checkpoints --recursive
+```
+
+Without `--recursive`, `tree` lists only the selected directory's immediate
+children. Add `--snapshot ID` to browse an older snapshot or generation. The
+same SAS read/list permissions are sufficient; Kopia projects also use the
+same repository password as every other read operation.
+
+Restore one directory and place its contents directly in a new destination:
+
+```bash
+podvault restore newlm \
+  --path checkpoints/run-42 \
+  --to "$HOME/run-42"
+```
+
+The selection must be one project-relative directory. Absolute paths, control
+characters, and `..` traversal are rejected. `--to` is required for a
+selective restore, and Podvault does not replace the project's remembered
+full-restore directory with the selective destination. Multiple selections in
+one command are intentionally not supported yet.
+
+Kopia resolves and restores the selected directory object. AzCopy lists and
+downloads only the selected generation prefix. Both engines still use an
+isolated sibling staging directory and compare the resulting subtree with
+remote metadata before exposing it at `--to`.
+
+## Delete a project
+
+Delete every remote snapshot or generation for a project with:
+
+```bash
+podvault delete newlm
+```
+
+Podvault shows the selected engine and requires the exact project name as
+confirmation. Use `--yes` for deliberate non-interactive deletion. The command
+never deletes the local project directory, but it does remove the project's
+local Podvault registration after the remote deletion succeeds.
+
+For AzCopy projects, deletion removes the complete project prefix, including
+orphaned generations from interrupted saves, and then removes the remote
+project record. For Kopia projects, Podvault explicitly deletes every tagged
+complete or incomplete snapshot through Kopia; it never removes shared
+repository blobs directly. If orphaned AzCopy data has lost its project record,
+select it explicitly with `podvault delete PROJECT --engine azcopy`.
+Safe full Kopia maintenance runs afterward to reclaim content that is no
+longer referenced by any project. Kopia safety windows can defer physical blob
+reclamation. Use `--no-maintenance` to make the command finish sooner and run
+full maintenance separately later.
+
+Do not save or restore the same project concurrently with deletion. Azure Blob
+soft-delete, versioning, or immutability policies can retain deleted data or
+prevent immediate physical reclamation.
 
 Add global `--json` for a machine-readable final result and `--config PATH` to
 isolate local Podvault state:
@@ -212,9 +279,10 @@ into place. POSIX metadata and symbolic links are preserved using AzCopy's Blob
 metadata support.
 
 AzCopy generations are not compressed or deduplicated and Podvault does not
-prune them in 0.2.0. Each successful save therefore adds approximately one
-complete project tree to Azure storage. Use a dedicated container and monitor
-its size.
+automatically prune them in 0.2.0. Each successful save therefore adds
+approximately one complete project tree to Azure storage. `podvault delete`
+removes every generation for the selected project. Use a dedicated container
+and monitor its size.
 
 AzCopy v10 accepts SAS credentials only as part of its Azure URL. Podvault
 redacts the SAS from console output and errors, but while an AzCopy child
@@ -251,6 +319,10 @@ application-level checkpoint state.
 Both engines refuse a file, symbolic-link destination, or nonempty directory.
 Both restore into a random temporary sibling directory, compare the restored
 tree with committed metadata, and only then rename it into place.
+
+For a selective restore, `--path` must identify a directory in the selected
+snapshot and `--to` is mandatory. The restored destination contains that
+directory's contents, not an additional copy of its parent path.
 
 An interrupted or failed restore preserves the staging directory and a sibling
 `.podvault-restore-state-*.json` marker. See the disaster-recovery guide before

@@ -60,15 +60,28 @@ the Kopia command arguments.
 ### Kopia restore
 
 1. Select and structurally verify the requested snapshot.
-2. Validate the destination and create a randomized sibling staging path.
-3. Restore with adaptive parallelism up to 32 and overwrite modes disabled.
-4. Walk the staged tree and compare logical bytes and entry counts.
-5. Rename the staged directory into place and write a receipt.
+2. If `--path` is present, walk Kopia directory metadata to prove that the
+   normalized relative path exists and is a directory, and capture its summary.
+3. Validate the destination and create a randomized sibling staging path.
+4. Restore the root object or `ROOT_OBJECT_ID/relative/path` with adaptive
+   parallelism up to 32 and overwrite modes disabled.
+5. Walk the staged tree and compare logical bytes and entry counts with the
+   selected root or subtree summary.
+6. Rename the staged directory into place and write a receipt.
 
 Normal 0.2 restores intentionally leave Kopia's per-file atomic-write and flush
 options disabled. The entire tree is already isolated until validation and
 promotion. `--durable` enables both slower options for users who explicitly
 need them.
+
+### Kopia deletion
+
+Podvault lists complete and incomplete snapshots by the exact project tag,
+deletes each manifest using Kopia's confirmed snapshot-deletion operation, and
+verifies that no tagged snapshot remains. It then runs full maintenance with
+Kopia's default `full` safety level. Maintenance failure is reported separately
+because the project is no longer restorable even though unreferenced physical
+blobs may remain. Shared content is never deleted directly from Azure.
 
 ## AzCopy format
 
@@ -99,18 +112,40 @@ prune generations.
 
 1. Resolve the current or explicitly requested generation and validate its
    manifest.
-2. Download into a randomized sibling staging path with AzCopy's MD5 mismatch
-   behavior set to fail.
-3. Compare the restored tree with the manifest.
-4. Rename the staged directory into place and write a receipt.
+2. If `--path` is present, validate the remote directory prefix and derive a
+   subtree summary from blob names, sizes, and AzCopy's directory/symlink
+   metadata.
+3. Download the generation root or selected directory prefix into a randomized
+   sibling staging path with AzCopy's MD5 mismatch behavior set to fail.
+4. Compare the restored tree with the full manifest or subtree summary.
+5. Rename the staged directory into place and write a receipt.
 
 `AZCOPY_CONCURRENCY_VALUE` defaults to `AUTO`. Because the whole tree is staged,
 `AZCOPY_DOWNLOAD_TO_TEMP_PATH` defaults to `false` to avoid redundant per-file
 temporary paths. Users may override either environment variable.
 
+### AzCopy deletion
+
+Podvault recursively removes the project's entire AzCopy prefix, verifies that
+the prefix is empty, and deletes the remote project record last. This includes
+committed generations and orphaned generations left by interrupted uploads.
+The local working directory is outside this flow and is never removed.
+
 Unlike the Kopia reconnect token, SAS authentication must appear in AzCopy's
 Azure URL and is therefore transiently visible in the AzCopy child process's
 arguments. Output and errors are redacted.
+
+## Remote tree browsing
+
+`podvault tree` uses the selected snapshot or generation without restoring
+file contents. For Kopia, immediate directory metadata comes from directory
+objects and recursive output comes from Kopia's repository listing. For
+AzCopy, non-recursive output uses Azure Blob's delimiter-based hierarchical
+listing, while recursive output enumerates only the selected data prefix.
+
+Every user path is normalized as a POSIX project-relative path before it is
+combined with a Kopia object ID or Azure blob prefix. Absolute paths, control
+characters, and any `..` component are rejected.
 
 ## Restore failure state
 

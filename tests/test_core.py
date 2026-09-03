@@ -4,13 +4,16 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import unquote, urlsplit
 
-from podvault.azure import parse_sas_url
+from podvault.azure import AzureBlobClient, parse_sas_url
 from podvault.azcopy import AzCopyRunner
+from podvault.browse import kopia_tree
 from podvault.catalog import ProjectCatalog
 from podvault.cli import Application, _parser
 from podvault.config import ConfigStore
@@ -24,7 +27,7 @@ from podvault.errors import (
 )
 from podvault.kopia import CommandResult, KopiaRunner
 from podvault.output import Console
-from podvault.paths import validate_destination, validate_source
+from podvault.paths import validate_destination, validate_relative_path, validate_source
 from podvault.project import canonical_source, snapshot_tags
 from podvault.receipts import ReceiptStore
 from podvault.redaction import redact
@@ -36,6 +39,7 @@ VALID_SAS = (
     "https://account123.blob.core.windows.net/podvault"
     "?sv=2024-11-04&sr=c&sp=rcwl&spr=https&se=2099-01-01T00%3A00%3A00Z&sig=secret"
 )
+DELETE_SAS = VALID_SAS.replace("sp=rcwl", "sp=rcwld")
 
 
 class AzureTests(unittest.TestCase):
@@ -69,6 +73,37 @@ class AzureTests(unittest.TestCase):
         with self.assertRaises(CredentialError):
             without_create.require_azcopy_permissions(write=True)
 
+    def test_delete_requires_delete_permission(self):
+        parse_sas_url(DELETE_SAS).require_delete_permissions(repository_write=True)
+        with self.assertRaises(CredentialError):
+            parse_sas_url(VALID_SAS).require_delete_permissions()
+
+    def test_relative_snapshot_paths_are_normalized_and_traversal_is_rejected(self):
+        self.assertEqual(
+            validate_relative_path("./checkpoints//run-42"),
+            "checkpoints/run-42",
+        )
+        self.assertEqual(validate_relative_path("."), "")
+        for value in ("/etc", "../checkpoints", "checkpoints/../../etc", "bad\nname"):
+            with self.subTest(value=value), self.assertRaises(SafetyError):
+                validate_relative_path(value)
+
+    def test_hierarchical_blob_listing_includes_metadata(self):
+        xml = b"""<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults><Blobs>
+  <BlobPrefix><Name>data/checkpoints/</Name></BlobPrefix>
+  <Blob><Name>data/link</Name><Properties><Last-Modified>now</Last-Modified><Content-Length>6</Content-Length></Properties><Metadata><is_symlink>true</is_symlink></Metadata></Blob>
+</Blobs><NextMarker /></EnumerationResults>"""
+        with mock.patch("podvault.azure.urlopen", return_value=io.BytesIO(xml)) as opened:
+            values = AzureBlobClient(parse_sas_url(VALID_SAS)).list_blobs(
+                "data/", include_metadata=True, delimiter="/"
+            )
+        self.assertEqual(values[0]["type"], "directory")
+        self.assertEqual(values[1]["metadata"]["is_symlink"], "true")
+        request_url = opened.call_args.args[0].full_url
+        self.assertIn("include=metadata", request_url)
+        self.assertIn("delimiter=%2F", request_url)
+
 
 class ConfigEngineTests(unittest.TestCase):
     def test_project_engine_is_persisted_and_preserved(self):
@@ -80,6 +115,9 @@ class ConfigEngineTests(unittest.TestCase):
             config.set_project("newlm", second)
             self.assertEqual(config.get_project("newlm")["engine"], "azcopy")
             self.assertEqual(config.get_project("newlm")["path"], str(second))
+            self.assertTrue(config.remove_project("newlm"))
+            self.assertIsNone(config.get_project("newlm"))
+            self.assertFalse(config.remove_project("newlm"))
 
     def test_remote_engine_is_discovered_and_conflicts_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -126,6 +164,38 @@ class SafetyTests(unittest.TestCase):
             validate_destination("/workspace")
 
 
+class DeleteConfirmationTests(unittest.TestCase):
+    def test_requires_exact_project_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _parser().parse_args(
+                ["--config", str(Path(directory) / "config.json"), "delete", "newlm"]
+            )
+            app = Application(args)
+            with mock.patch.object(sys.stdin, "isatty", return_value=True), mock.patch(
+                "builtins.input", return_value="wrong-name"
+            ), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ConfigurationError):
+                    app._confirm_delete("newlm", "kopia", "2 Kopia snapshots")
+
+    def test_yes_allows_noninteractive_deletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _parser().parse_args(
+                [
+                    "--config",
+                    str(Path(directory) / "config.json"),
+                    "delete",
+                    "newlm",
+                    "--yes",
+                ]
+            )
+            app = Application(args)
+            with mock.patch.object(sys.stdin, "isatty", return_value=False):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    app._confirm_delete(
+                        "newlm", "azcopy", "every stored generation"
+                    )
+
+
 class ProjectIdentityTests(unittest.TestCase):
     def test_identity_is_independent_of_host_and_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -160,6 +230,86 @@ class SnapshotSelectionTests(unittest.TestCase):
         ]
         self.assertEqual(select_snapshot(snapshots)["id"], "manifest-new")
         self.assertEqual(select_snapshot(snapshots, "stable-old")["id"], "manifest-old")
+
+
+class DeletingKopiaRunner:
+    def __init__(self, fail_maintenance=False):
+        self.snapshots = [
+            {
+                "id": "manifest-one",
+                "tags": {
+                    "tag:podvault.schema": "1",
+                    "tag:podvault.project": "newlm",
+                },
+            },
+            {
+                "id": "manifest-two",
+                "tags": {
+                    "tag:podvault.schema": "1",
+                    "tag:podvault.project": "newlm",
+                },
+            },
+        ]
+        self.deleted = []
+        self.list_calls = []
+        self.maintenance_calls = 0
+        self.fail_maintenance = fail_maintenance
+
+    def run_streaming(self, args, **kwargs):
+        return self.run(args, **kwargs)
+
+    def run(self, args, **kwargs):
+        values = list(args)
+        if "list" in values:
+            self.list_calls.append(values)
+            return CommandResult(values, 0, json.dumps(self.snapshots), "")
+        if "delete" in values:
+            manifest_id = values[values.index("delete") + 1]
+            self.deleted.append(manifest_id)
+            self.snapshots = [
+                item for item in self.snapshots if item["id"] != manifest_id
+            ]
+            return CommandResult(values, 0, "", "")
+        if "maintenance" in values:
+            self.maintenance_calls += 1
+            if self.fail_maintenance:
+                raise KopiaCommandError("injected maintenance failure")
+            return CommandResult(values, 0, "", "")
+        raise AssertionError(values)
+
+
+class KopiaDeletionTests(unittest.TestCase):
+    def test_deletes_all_project_snapshots_and_runs_safe_maintenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = DeletingKopiaRunner()
+            service = SnapshotService(
+                runner,
+                Console(False),
+                ReceiptStore(Path(directory) / "receipts"),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = service.delete_project("newlm", show_progress=False)
+            self.assertEqual(runner.deleted, ["manifest-one", "manifest-two"])
+            self.assertTrue(
+                all("--incomplete" in values for values in runner.list_calls)
+            )
+            self.assertEqual(runner.maintenance_calls, 1)
+            self.assertEqual(result["deleted_snapshot_count"], 2)
+            self.assertEqual(result["maintenance"]["status"], "completed")
+
+    def test_maintenance_failure_does_not_misreport_snapshot_deletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = DeletingKopiaRunner(fail_maintenance=True)
+            service = SnapshotService(
+                runner,
+                Console(False),
+                ReceiptStore(Path(directory) / "receipts"),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = service.delete_project("newlm", show_progress=False)
+            self.assertEqual(runner.snapshots, [])
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["maintenance"]["status"], "failed")
 
 
 class RestoreSummaryTests(unittest.TestCase):
@@ -342,6 +492,140 @@ class OptimizedKopiaRestoreTests(unittest.TestCase):
             temporary.cleanup()
 
 
+class SelectiveKopiaRunner:
+    def __init__(self):
+        self.restore_args = []
+        self.directories = {
+            "root-object": {
+                "stream": "kopia:directory",
+                "summary": {"size": 8, "files": 2, "symlinks": 0, "dirs": 3},
+                "entries": [
+                    {"name": "checkpoints", "type": "d", "obj": "checkpoints-object", "size": 8}
+                ],
+            },
+            "checkpoints-object": {
+                "stream": "kopia:directory",
+                "summary": {"size": 8, "files": 2, "symlinks": 0, "dirs": 2},
+                "entries": [
+                    {"name": "run-42", "type": "d", "obj": "run-object", "size": 8}
+                ],
+            },
+            "run-object": {
+                "stream": "kopia:directory",
+                "summary": {"size": 8, "files": 2, "symlinks": 0, "dirs": 1},
+                "entries": [
+                    {"name": "model.bin", "type": "f", "obj": "file-object", "size": 4},
+                    {"name": " leading.bin", "type": "f", "obj": "file-object-2", "size": 4},
+                ],
+            },
+        }
+
+    def run_streaming(self, args, **kwargs):
+        return self.run(args, **kwargs)
+
+    def run(self, args, **kwargs):
+        if "snapshot" in args and "list" in args:
+            snapshot = {
+                "id": "manifest-id",
+                "endTime": "2026-01-01T00:00:00Z",
+                "tags": {
+                    "tag:podvault.schema": "1",
+                    "tag:podvault.project": "newlm",
+                    "tag:podvault.snapshot": "stable-id",
+                },
+                "rootEntry": {"obj": "root-object", "summ": self.directories["root-object"]["summary"]},
+            }
+            return CommandResult(list(args), 0, json.dumps([snapshot]), "")
+        if "verify" in args:
+            return CommandResult(list(args), 0, json.dumps({"errorCount": 0}), "")
+        if "show" in args:
+            object_id = args[args.index("show") + 1]
+            return CommandResult(list(args), 0, json.dumps(self.directories[object_id]), "")
+        if "list" in args and "--recursive" in args:
+            output = (
+                "drwxr-xr-x 4 2026-01-01 00:00:00 UTC {:<34} {}\n".format(
+                    "run-object-2", "run-42/"
+                )
+                + "-rw-r--r-- 4 2026-01-01 00:00:00 UTC {:<34} {}\n".format(
+                    "file-object", "run-42/model.bin"
+                )
+                + "-rw-r--r-- 4 2026-01-01 00:00:00 UTC {:<34} {}\n".format(
+                    "file-object-2", "run-42/ leading.bin"
+                )
+            )
+            return CommandResult(list(args), 0, output, "")
+        if "restore" in args:
+            self.restore_args = list(args)
+            destination = Path(args[args.index("restore") + 2])
+            destination.mkdir()
+            (destination / "model.bin").write_text("data", encoding="utf-8")
+            (destination / " leading.bin").write_text("data", encoding="utf-8")
+            return CommandResult(list(args), 0, "", "")
+        raise AssertionError(args)
+
+
+class SelectiveKopiaTests(unittest.TestCase):
+    def test_tree_and_selective_restore_use_directory_object(self):
+        runner = SelectiveKopiaRunner()
+        listing = kopia_tree(runner, "root-object", "checkpoints", recursive=True)
+        self.assertEqual(
+            [item["path"] for item in listing["entries"]],
+            [
+                "checkpoints/run-42",
+                "checkpoints/run-42/model.bin",
+                "checkpoints/run-42/ leading.bin",
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = ConfigStore(root / "config.json")
+            remembered = root / "complete-project"
+            config.set_project("newlm", remembered, engine="kopia")
+            service = RestoreService(
+                runner,
+                Console(False),
+                ReceiptStore(root / "receipts"),
+                config,
+            )
+            destination = root / "run-42"
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = service.restore(
+                    "newlm",
+                    None,
+                    str(destination),
+                    show_progress=False,
+                    relative_path="checkpoints/run-42",
+                )
+            self.assertEqual(
+                runner.restore_args[runner.restore_args.index("restore") + 1],
+                "root-object/checkpoints/run-42",
+            )
+            self.assertEqual(result["path"], "checkpoints/run-42")
+            self.assertTrue(result["selective"])
+            self.assertEqual(config.get_project("newlm")["path"], str(remembered))
+            self.assertEqual((destination / "model.bin").read_text(), "data")
+
+    def test_selective_restore_requires_destination_and_directory(self):
+        runner = SelectiveKopiaRunner()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = RestoreService(
+                runner,
+                Console(False),
+                ReceiptStore(root / "receipts"),
+                ConfigStore(root / "config.json"),
+            )
+            with self.assertRaises(ConfigurationError):
+                service.restore("newlm", None, None, relative_path="checkpoints")
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(ConfigurationError):
+                service.restore(
+                    "newlm",
+                    None,
+                    str(root / "bad"),
+                    show_progress=False,
+                    relative_path="checkpoints/run-42/model.bin",
+                )
+
 class MemoryBlobClient:
     def __init__(self):
         self.values = {}
@@ -355,19 +639,50 @@ class MemoryBlobClient:
             return None
         return json.loads(json.dumps(value)) if value is not None else None
 
-    def list_blobs(self, prefix):
-        return [
-            {"name": name, "size": len(json.dumps(value))}
-            for name, value in self.values.items()
-            if name.startswith(prefix)
-        ]
+    def delete_blob(self, path, missing_ok=False):
+        if path not in self.values:
+            return False
+        del self.values[path]
+        return True
+
+    def list_blobs(self, prefix, include_metadata=False, delimiter=None):
+        result = {}
+        for name, value in self.values.items():
+            if not name.startswith(prefix):
+                continue
+            remainder = name[len(prefix) :]
+            if delimiter and delimiter in remainder:
+                first = remainder.split(delimiter, 1)[0]
+                item_name = prefix + first + delimiter
+                result[(item_name, "directory")] = {
+                    "name": item_name,
+                    "size": None,
+                    "metadata": {},
+                    "type": "directory",
+                }
+                continue
+            metadata = value.get("_metadata", {}) if isinstance(value, dict) else {}
+            size = (
+                value.get("_blob_size", len(json.dumps(value)))
+                if isinstance(value, dict)
+                else len(json.dumps(value))
+            )
+            result[(name, "blob")] = {
+                "name": name,
+                "size": size,
+                "metadata": metadata,
+                "last_modified": None,
+            }
+        return list(result.values())
 
 
 class FakeAzCopyRunner:
-    def __init__(self, restore_source):
+    def __init__(self, restore_source, blobs=None):
         self.restore_source = restore_source
+        self.blobs = blobs
         self.uploads = []
         self.downloads = []
+        self.deletions = []
         self.fail_upload = False
 
     def require_supported_version(self):
@@ -377,10 +692,42 @@ class FakeAzCopyRunner:
         if self.fail_upload:
             raise RuntimeError("injected AzCopy failure")
         self.uploads.append((source, destination_url, show_progress))
+        if self.blobs is not None:
+            path = unquote(urlsplit(destination_url).path).lstrip("/")
+            _, prefix = path.split("/", 1)
+            for item in source.rglob("*"):
+                relative = item.relative_to(source).as_posix()
+                metadata = {}
+                if item.is_symlink():
+                    metadata["is_symlink"] = "true"
+                    size = len(os.readlink(str(item)).encode("utf-8"))
+                elif item.is_dir():
+                    metadata["hdi_isfolder"] = "true"
+                    size = 0
+                else:
+                    size = item.stat().st_size
+                self.blobs.values[prefix + "/" + relative] = {
+                    "_blob_size": size,
+                    "_metadata": metadata,
+                }
 
     def download_tree(self, source_url, destination, show_progress):
         self.downloads.append((source_url, destination, show_progress))
-        shutil.copytree(self.restore_source, destination, symlinks=True)
+        decoded = unquote(urlsplit(source_url).path)
+        selected = self.restore_source
+        if "/data/" in decoded:
+            selected = selected / decoded.split("/data/", 1)[1]
+        shutil.copytree(selected, destination, symlinks=True)
+
+    def delete_tree(self, source_url, show_progress):
+        self.deletions.append((source_url, show_progress))
+        if self.blobs is None:
+            return
+        path = unquote(urlsplit(source_url).path).lstrip("/")
+        _, prefix = path.split("/", 1)
+        for key in list(self.blobs.values):
+            if key.startswith(prefix + "/"):
+                del self.blobs.values[key]
 
 
 class AzCopyServiceTests(unittest.TestCase):
@@ -393,7 +740,7 @@ class AzCopyServiceTests(unittest.TestCase):
             (source / "link").symlink_to("file.txt")
             blobs = MemoryBlobClient()
             catalog = ProjectCatalog(blobs)
-            runner = FakeAzCopyRunner(source)
+            runner = FakeAzCopyRunner(source, blobs)
             config = ConfigStore(root / "config.json")
             service = AzCopyService(
                 runner,
@@ -430,6 +777,118 @@ class AzCopyServiceTests(unittest.TestCase):
                 Path(failure.exception.receipt_path).read_text(encoding="utf-8")
             )
             self.assertFalse(receipt["safe_to_terminate"])
+
+    def test_delete_removes_all_generations_and_catalog_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "file.txt").write_text("data", encoding="utf-8")
+            blobs = MemoryBlobClient()
+            catalog = ProjectCatalog(blobs)
+            runner = FakeAzCopyRunner(source, blobs)
+            service = AzCopyService(
+                runner,
+                parse_sas_url(DELETE_SAS),
+                blobs,
+                catalog,
+                Console(False),
+                ReceiptStore(root / "receipts"),
+                ConfigStore(root / "config.json"),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                service.save(source, "newlm", "one", show_progress=False)
+                service.save(source, "newlm", "two", show_progress=False)
+                result = service.delete_project("newlm", show_progress=False)
+            self.assertEqual(result["deleted_generations"], "all")
+            self.assertIsNone(catalog.get("newlm"))
+            self.assertFalse(
+                blobs.list_blobs(".podvault/azcopy/v1/projects/newlm/")
+            )
+            self.assertEqual(len(runner.deletions), 1)
+
+    def test_tree_and_selective_restore_use_only_selected_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            selected = source / "checkpoints" / "run-42"
+            selected.mkdir(parents=True)
+            (selected / "model.bin").write_bytes(b"weights")
+            (source / "root.txt").write_text("root", encoding="utf-8")
+            (source / "root-link").symlink_to("root.txt")
+            blobs = MemoryBlobClient()
+            catalog = ProjectCatalog(blobs)
+            runner = FakeAzCopyRunner(source, blobs)
+            config = ConfigStore(root / "config.json")
+            service = AzCopyService(
+                runner,
+                parse_sas_url(VALID_SAS),
+                blobs,
+                catalog,
+                Console(False),
+                ReceiptStore(root / "receipts"),
+                config,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                service.save(source, "newlm", "direct", show_progress=False)
+            top = service.tree("newlm", None, None, recursive=False)
+            self.assertEqual(
+                [(item["path"], item["type"]) for item in top["entries"]],
+                [
+                    ("checkpoints", "directory"),
+                    ("root-link", "symlink"),
+                    ("root.txt", "file"),
+                ],
+            )
+            subtree = service.tree(
+                "newlm", None, "checkpoints", recursive=True
+            )
+            self.assertEqual(
+                [item["path"] for item in subtree["entries"]],
+                ["checkpoints/run-42", "checkpoints/run-42/model.bin"],
+            )
+
+            destination = root / "run-42"
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = service.restore(
+                    "newlm",
+                    None,
+                    str(destination),
+                    show_progress=False,
+                    relative_path="checkpoints/run-42",
+                )
+            self.assertEqual((destination / "model.bin").read_bytes(), b"weights")
+            self.assertFalse((destination / "root.txt").exists())
+            self.assertEqual(result["restored_summary"]["files"], 1)
+            self.assertTrue(result["selective"])
+            self.assertTrue(runner.downloads[-1][0].split("?", 1)[0].endswith("/data/checkpoints/run-42"))
+            self.assertEqual(config.get_project("newlm")["path"], str(source))
+
+            with self.assertRaises(ConfigurationError):
+                service.tree("newlm", None, "root.txt", recursive=False)
+
+    def test_delete_can_remove_orphaned_generation_without_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            blobs = MemoryBlobClient()
+            orphan = ".podvault/azcopy/v1/projects/newlm/snapshots/orphan/data/file"
+            blobs.values[orphan] = {"content": "placeholder"}
+            runner = FakeAzCopyRunner(source, blobs)
+            service = AzCopyService(
+                runner,
+                parse_sas_url(DELETE_SAS),
+                blobs,
+                ProjectCatalog(blobs),
+                Console(False),
+                ReceiptStore(root / "receipts"),
+                ConfigStore(root / "config.json"),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = service.delete_project("newlm", show_progress=False)
+            self.assertFalse(result["catalog_record_deleted"])
+            self.assertNotIn(orphan, blobs.values)
 
 
 class StreamingProgressTests(unittest.TestCase):

@@ -184,3 +184,15 @@ class AzCopyRunner:
             ],
             show_progress=show_progress,
         )
+
+    def delete_tree(self, source_url: str, show_progress: bool) -> None:
+        self.run(
+            [
+                "remove",
+                source_url,
+                "--recursive=true",
+                "--delete-snapshots=include",
+                "--log-level=ERROR",
+            ],
+            show_progress=show_progress,
+        )
