@@ -13,7 +13,7 @@ The engine is stored in both local configuration and a small remote project
 record. Later commands need only the project name; Podvault refuses to open an
 existing project with the other engine.
 
-> **Status:** 0.3.0 is an alpha release. Test the complete save/restore workflow
+> **Status:** 0.4.0 is an alpha release. Test the complete save/restore workflow
 > with non-critical data before making it your only recovery path.
 
 ## Choose an engine
@@ -120,8 +120,8 @@ Requirements are Linux and Python 3.9 or newer. Kopia projects require Kopia
 Install the release wheel when the transfer binaries are already available:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.3.0/podvault-0.3.0-py3-none-any.whl
-python3 -m pip install podvault-0.3.0-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.4.0/podvault-0.4.0-py3-none-any.whl
+python3 -m pip install podvault-0.4.0-py3-none-any.whl
 podvault doctor
 ```
 
@@ -129,8 +129,8 @@ The bootstrap helper installs checksum-pinned Kopia 0.23.1, AzCopy 10.32.6,
 and the supplied wheel under `~/.local`:
 
 ```bash
-curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.3.0/bootstrap-linux.sh
-bash bootstrap-linux.sh podvault-0.3.0-py3-none-any.whl
+curl -fLO https://github.com/konpuringu/podvault/releases/download/v0.4.0/bootstrap-linux.sh
+bash bootstrap-linux.sh podvault-0.4.0-py3-none-any.whl
 export PATH="$HOME/.local/bin:$PATH"
 podvault doctor
 ```
@@ -150,9 +150,13 @@ podvault tree PROJECT [--latest | --snapshot ID] [--path DIR] [--recursive]
 podvault restore PROJECT [--latest | --snapshot ID] [--to PATH] [--no-progress]
 podvault restore PROJECT --path DIR --to PATH
 podvault restore PROJECT [--parallel N] [--durable]       # Kopia only
+podvault restore PROJECT --preserve-owners               # Kopia; normally needs root
 podvault verify PROJECT [--latest | --snapshot ID] [--sample-percent N]
 podvault pin PROJECT [--latest | --snapshot ID] --label TEXT  # Kopia only
 podvault delete PROJECT [--yes] [--no-progress]
+podvault delete PROJECT --snapshot ID
+podvault delete PROJECT --through ID
+podvault delete PROJECT --before 2026-09-01
 podvault delete PROJECT --no-maintenance  # Kopia: defer storage reclamation
 
 podvault configure PATH --name PROJECT [--engine kopia|azcopy]
@@ -200,7 +204,7 @@ downloads only the selected generation prefix. Both engines still use an
 isolated sibling staging directory and compare the resulting subtree with
 remote metadata before exposing it at `--to`.
 
-## Delete a project
+## Delete snapshots or a project
 
 Delete every remote snapshot or generation for a project with:
 
@@ -211,7 +215,29 @@ podvault delete newlm
 Podvault shows the selected engine and requires the exact project name as
 confirmation. Use `--yes` for deliberate non-interactive deletion. The command
 never deletes the local project directory, but it does remove the project's
-local Podvault registration after the remote deletion succeeds.
+local Podvault registration after the final remote version is deleted.
+
+Delete exactly one historical version, or an inclusive prefix of history:
+
+```bash
+podvault delete newlm --snapshot 8da83b8bfa65
+podvault delete newlm --through 8da83b8bfa65
+```
+
+`--through` deletes the selected version and every version with the same or an
+earlier timestamp. A short Podvault or Kopia snapshot ID is accepted when it is
+unambiguous. To use a time cutoff instead, `--before` is strict:
+
+```bash
+podvault delete newlm --before 2026-09-01
+podvault delete newlm --before 2026-09-01T12:00:00-07:00
+```
+
+A date without a time means midnight UTC. The project record and remembered
+local path remain when at least one version survives. If selective deletion
+removes the current AzCopy generation, Podvault first repoints the project to
+the newest surviving generation; that case requires SAS write permission in
+addition to read, list, and delete.
 
 For AzCopy projects, deletion removes the complete project prefix, including
 orphaned generations from interrupted saves, and then removes the remote
@@ -259,6 +285,22 @@ filesystem writeback is more important than restore time.
 Receipts separately report repository verification, data transfer, final tree
 scan, and total elapsed time.
 
+## Restoring without root
+
+Kopia restores normally skip the saved UID and GID, so files are owned by the
+account running Podvault. Permissions (including executable bits), timestamps,
+contents, directories, and symbolic links are still restored as far as the
+destination filesystem supports them. This makes a project saved by root on
+RunPod usable when restored by an ordinary cluster account:
+
+```bash
+podvault restore newlm --to "$HOME/newlm"
+```
+
+The destination's parent must be writable. Administrators who explicitly need
+the original UID/GID can opt in with `--preserve-owners`; restoring owners that
+differ from the current account normally requires root.
+
 ## AzCopy format and safety model
 
 AzCopy data is stored under:
@@ -279,10 +321,10 @@ into place. POSIX metadata and symbolic links are preserved using AzCopy's Blob
 metadata support.
 
 AzCopy generations are not compressed or deduplicated and Podvault does not
-automatically prune them. Each successful save therefore adds
-approximately one complete project tree to Azure storage. `podvault delete`
-removes every generation for the selected project. Use a dedicated container
-and monitor its size.
+automatically prune them. Each successful save therefore adds approximately
+one complete project tree to Azure storage. Use selective `podvault delete`
+options to remove old generations, or omit a selector to remove the complete
+project. Use a dedicated container and monitor its size.
 
 AzCopy v10 accepts SAS credentials only as part of its Azure URL. Podvault
 redacts the SAS from console output and errors, but while an AzCopy child

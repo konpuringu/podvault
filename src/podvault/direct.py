@@ -455,6 +455,7 @@ class AzCopyService:
         project = validate_project_name(project)
         record = self.catalog.get(project)
         prefix = "{}/{}".format(AZCOPY_PREFIX, project)
+        generation_count = len(self.list(project))
         if record and record.get("engine") != "azcopy":
             raise ConfigurationError(
                 "project {} is not stored with AzCopy".format(project)
@@ -482,5 +483,76 @@ class AzCopyService:
             "engine": "azcopy",
             "project": project,
             "deleted_generations": "all",
+            "deleted_generation_count": generation_count,
+            "remaining_snapshot_count": 0,
+            "project_deleted": True,
+            "catalog_record_deleted": catalog_record_deleted,
+        }
+
+    def delete_snapshots(
+        self,
+        project: str,
+        snapshots: List[Dict[str, Any]],
+        show_progress: bool,
+    ) -> Dict[str, Any]:
+        project = validate_project_name(project)
+        if not snapshots:
+            raise ConfigurationError("no AzCopy generations selected for deletion")
+        available = self.list(project)
+        available_by_id = {
+            str(item.get("podvault_snapshot_id") or ""): item for item in available
+        }
+        selected_ids = [
+            str(item.get("podvault_snapshot_id") or "") for item in snapshots
+        ]
+        if any(not value or value not in available_by_id for value in selected_ids):
+            raise ConfigurationError("selected AzCopy generation is no longer available")
+        selected_set = set(selected_ids)
+        remaining = [
+            item
+            for item in available
+            if str(item.get("podvault_snapshot_id") or "") not in selected_set
+        ]
+        record = self.catalog.get(project)
+        current = str((record or {}).get("current_snapshot") or "")
+        next_current: Optional[str] = current or None
+        if current in selected_set and remaining:
+            # Repoint before deleting the current generation. If deletion is
+            # interrupted, the project still resolves to a complete version.
+            self.sas.require_delete_permissions(repository_write=True)
+            newest = select_direct_snapshot(remaining, None)
+            next_current = str(newest["podvault_snapshot_id"])
+            self.catalog.commit(project, "azcopy", current_snapshot=next_current)
+
+        for index, snapshot_id in enumerate(selected_ids, start=1):
+            self.console.info(
+                "Deleting AzCopy generation {}/{}...".format(index, len(selected_ids))
+            )
+            prefix = snapshot_prefix(project, snapshot_id)
+            self.runner.delete_tree(
+                self.sas.blob_url(prefix), show_progress=show_progress
+            )
+            leftovers = self.blobs.list_blobs(prefix + "/")
+            if leftovers:
+                raise VerificationError(
+                    "AzCopy deletion left {} blob(s) in generation {}".format(
+                        len(leftovers), snapshot_id
+                    )
+                )
+
+        catalog_record_deleted = False
+        if not remaining:
+            catalog_record_deleted = self.catalog.delete(project)
+            next_current = None
+        return {
+            "status": "success",
+            "operation": "delete",
+            "engine": "azcopy",
+            "project": project,
+            "deleted_generation_count": len(selected_ids),
+            "deleted_podvault_snapshot_ids": selected_ids,
+            "remaining_snapshot_count": len(remaining),
+            "project_deleted": not remaining,
+            "current_snapshot": next_current,
             "catalog_record_deleted": catalog_record_deleted,
         }

@@ -17,13 +17,14 @@ from .browse import kopia_tree
 from .catalog import ProjectCatalog, SUPPORTED_ENGINES
 from .config import ConfigStore
 from .credentials import CredentialStore
-from .direct import AzCopyService
+from .direct import AzCopyService, select_direct_snapshot
 from .errors import ConfigurationError, PodvaultError
 from .kopia import KopiaRunner
 from .output import Console
 from .paths import AppPaths, validate_relative_path, validate_source
 from .project import validate_project_name
 from .receipts import ReceiptStore
+from .retention import snapshots_before, snapshots_through
 from .repository import RepositoryManager
 from .restore import RestoreService
 from .snapshots import SnapshotService, list_snapshots, select_snapshot, snapshot_view
@@ -136,6 +137,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Kopia: flush every file and use per-file atomic writes (slower)",
     )
     restore.add_argument(
+        "--preserve-owners",
+        action="store_true",
+        help="Kopia: restore original UID/GID (normally requires root)",
+    )
+    restore.add_argument(
         "--no-progress", action="store_true", help="disable live transfer progress output"
     )
 
@@ -159,10 +165,24 @@ def _parser() -> argparse.ArgumentParser:
     pin.add_argument("--label", required=True)
 
     delete = commands.add_parser(
-        "delete", help="permanently delete a remote project and all of its snapshots"
+        "delete", help="permanently delete remote snapshots or a complete project"
     )
     delete.add_argument("project")
     delete.add_argument("--engine", choices=SUPPORTED_ENGINES, default=None)
+    delete_scope = delete.add_mutually_exclusive_group()
+    delete_scope.add_argument(
+        "--snapshot", help="delete exactly one snapshot or generation"
+    )
+    delete_scope.add_argument(
+        "--through",
+        metavar="SNAPSHOT",
+        help="delete this snapshot or generation and every older one",
+    )
+    delete_scope.add_argument(
+        "--before",
+        metavar="TIMESTAMP",
+        help="delete versions strictly before an ISO-8601 timestamp or UTC date",
+    )
     delete.add_argument(
         "--yes", action="store_true", help="skip the interactive project-name confirmation"
     )
@@ -563,9 +583,14 @@ class Application:
             raise ConfigurationError("--path requires an explicit --to destination")
         engine = self._resolve_engine(project, self.args.engine)
         if engine == "azcopy":
-            if self.args.parallel is not None or self.args.durable:
+            if (
+                self.args.parallel is not None
+                or self.args.durable
+                or self.args.preserve_owners
+            ):
                 raise ConfigurationError(
-                    "--parallel and --durable apply only to Kopia projects; tune AzCopy with AZCOPY_CONCURRENCY_VALUE"
+                    "--parallel, --durable, and --preserve-owners apply only to "
+                    "Kopia projects; tune AzCopy with AZCOPY_CONCURRENCY_VALUE"
                 )
             service, _ = self._azcopy_service(write=False)
             payload = service.restore(
@@ -587,6 +612,7 @@ class Application:
                 parallel=parallel,
                 durable=self.args.durable,
                 relative_path=selected_path,
+                preserve_owners=self.args.preserve_owners,
             )
         selection = ":{}".format(selected_path) if selected_path else ""
         human = [
@@ -689,9 +715,9 @@ class Application:
 
     def _confirm_delete(self, project: str, engine: str, description: str) -> None:
         self.console.warning(
-            "This permanently deletes remote project '{}' ({}) and {}. "
+            "This permanently deletes {} from remote project '{}' ({}). "
             "The local project directory will not be touched.".format(
-                project, engine, description
+                description, project, engine
             )
         )
         if self.args.yes:
@@ -717,6 +743,18 @@ class Application:
         catalog: Optional[ProjectCatalog] = None
         azcopy_service: Optional[AzCopyService] = None
 
+        scope = "all"
+        cutoff: Optional[str] = None
+        if self.args.snapshot:
+            scope = "snapshot"
+            cutoff = self.args.snapshot
+        elif self.args.through:
+            scope = "through"
+            cutoff = self.args.through
+        elif self.args.before:
+            scope = "before"
+            cutoff = self.args.before
+
         if engine == "azcopy":
             if self.args.no_maintenance:
                 raise ConfigurationError(
@@ -732,8 +770,20 @@ class Application:
                     "AzCopy data".format(project)
                 )
             azcopy_service, _ = self._azcopy_service(write=False, delete=True)
-            description = "every stored generation"
-            snapshots: List[Dict[str, Any]] = []
+            snapshots = azcopy_service.list(project)
+            if scope == "snapshot":
+                selected_snapshots = [
+                    select_direct_snapshot(snapshots, self.args.snapshot)
+                ]
+            elif scope == "through":
+                anchor = select_direct_snapshot(snapshots, self.args.through)
+                selected_snapshots = snapshots_through(snapshots, anchor)
+            elif scope == "before":
+                selected_snapshots = snapshots_before(snapshots, self.args.before)
+            else:
+                selected_snapshots = snapshots
+            if scope != "all" and not selected_snapshots:
+                raise ConfigurationError("deletion selection matched no stored generations")
         else:
             runner = self.repository.ensure_connected(write=False, allow_create=False)
             snapshots = list_snapshots(runner, project, include_incomplete=True)
@@ -741,9 +791,27 @@ class Application:
                 raise ConfigurationError("project not found: {}".format(project))
             if self.config.repository.get("provider") == "azure":
                 _, _, catalog = self._azure_context(write=True, delete=True)
-            description = "{} Kopia snapshot{}".format(
-                len(snapshots), "" if len(snapshots) == 1 else "s"
-            )
+            if scope == "snapshot":
+                selected_snapshots = [select_snapshot(snapshots, self.args.snapshot)]
+            elif scope == "through":
+                anchor = select_snapshot(snapshots, self.args.through)
+                selected_snapshots = snapshots_through(snapshots, anchor)
+            elif scope == "before":
+                selected_snapshots = snapshots_before(snapshots, self.args.before)
+            else:
+                selected_snapshots = snapshots
+            if scope != "all" and not selected_snapshots:
+                raise ConfigurationError("deletion selection matched no stored snapshots")
+
+        unit = "generation" if engine == "azcopy" else "snapshot"
+        if scope == "all":
+            description = "all stored {}s".format(unit)
+        elif scope == "snapshot":
+            description = "{} {}".format(unit, cutoff)
+        elif scope == "through":
+            description = "{} {} and every older {}".format(unit, cutoff, unit)
+        else:
+            description = "{}s strictly before {}".format(unit, cutoff)
 
         self._confirm_delete(project, engine, description)
 
@@ -751,31 +819,61 @@ class Application:
             if engine == "azcopy":
                 if azcopy_service is None:
                     raise ConfigurationError("AzCopy deletion service is unavailable")
-                payload = azcopy_service.delete_project(
-                    project, show_progress=not self.args.no_progress
-                )
+                if scope == "all":
+                    payload = azcopy_service.delete_project(
+                        project, show_progress=not self.args.no_progress
+                    )
+                else:
+                    payload = azcopy_service.delete_snapshots(
+                        project,
+                        selected_snapshots,
+                        show_progress=not self.args.no_progress,
+                    )
             else:
                 runner = self.repository.ensure_connected(write=True, allow_create=False)
                 service = SnapshotService(runner, self.console, self.receipts)
                 payload = service.delete_project(
                     project,
-                    snapshots=snapshots,
+                    snapshots=selected_snapshots,
                     show_progress=not self.args.no_progress,
                     run_maintenance=not self.args.no_maintenance,
                 )
-                if catalog is not None:
+                if catalog is not None and payload["project_deleted"]:
                     payload["catalog_record_deleted"] = catalog.delete(project)
 
-            payload["local_configuration_deleted"] = self.config.remove_project(project)
+            payload["deletion_scope"] = scope
+            if cutoff:
+                payload["deletion_cutoff"] = cutoff
+            payload["local_configuration_deleted"] = (
+                self.config.remove_project(project)
+                if payload["project_deleted"]
+                else False
+            )
             payload["local_directory_deleted"] = False
         except Exception as exc:
+            requested_stable_ids = [
+                str(
+                    (
+                        item.get("podvault_snapshot_id")
+                        if engine == "azcopy"
+                        else snapshot_view(item).get("podvault_snapshot_id")
+                    )
+                    or ""
+                )
+                for item in selected_snapshots
+            ]
             failure = {
                 "status": "failed-or-partial",
                 "operation": "delete",
                 "engine": engine,
                 "project": project,
+                "deletion_scope": scope,
+                "deletion_cutoff": cutoff,
                 "requested_kopia_manifest_ids": [
-                    str(item.get("id") or "") for item in snapshots
+                    str(item.get("id") or "") for item in selected_snapshots
+                ],
+                "requested_podvault_snapshot_ids": [
+                    value for value in requested_stable_ids if value
                 ],
                 "local_directory_deleted": False,
                 "error": str(exc),
@@ -790,10 +888,7 @@ class Application:
         maintenance = payload.get("maintenance") or {}
         if maintenance.get("status") in ("failed", "skipped"):
             self.console.warning(str(maintenance.get("note")))
-        human = [
-            "Deleted remote project: {} ({})".format(project, engine),
-            "Local project directory deleted: NO",
-        ]
+        human = ["Deletion completed for {} ({})".format(project, engine)]
         if engine == "kopia":
             human.extend(
                 [
@@ -804,7 +899,22 @@ class Application:
                 ]
             )
         else:
-            human.append("AzCopy generations deleted: ALL")
+            human.append(
+                "AzCopy generations deleted: {}".format(
+                    payload["deleted_generation_count"]
+                )
+            )
+        human.extend(
+            [
+                "Remaining stored versions: {}".format(
+                    payload["remaining_snapshot_count"]
+                ),
+                "Remote project deleted: {}".format(
+                    "YES" if payload["project_deleted"] else "NO"
+                ),
+                "Local project directory deleted: NO",
+            ]
+        )
         human.append("Receipt: {}".format(payload["receipt_path"]))
         self.console.result(payload, human)
         return 0

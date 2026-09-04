@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "podvault"
-version = "0.3.0"
+version = "0.4.0"
 description = "Save and restore ephemeral GPU-pod projects with Kopia or AzCopy"
 readme = "README.md"
 requires-python = ">=3.9"

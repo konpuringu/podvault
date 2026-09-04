@@ -40,6 +40,11 @@ required.
    podvault restore newlm
    ```
 
+   Kopia restores keep ownership with the current user by default, so this
+   works without root when the destination parent is writable. Use
+   `--preserve-owners` only when exact saved UID/GID restoration is required
+   and the invoking account has permission to change ownership.
+
    To recover another generation or location:
 
    ```bash

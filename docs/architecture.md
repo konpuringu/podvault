@@ -64,7 +64,8 @@ the Kopia command arguments.
    normalized relative path exists and is a directory, and capture its summary.
 3. Validate the destination and create a randomized sibling staging path.
 4. Restore the root object or `ROOT_OBJECT_ID/relative/path` with adaptive
-   parallelism up to 32 and overwrite modes disabled.
+   parallelism up to 32, overwrite modes disabled, and saved ownership skipped
+   unless the user explicitly requests original UID/GID restoration.
 5. Walk the staged tree and compare logical bytes and entry counts with the
    selected root or subtree summary.
 6. Rename the staged directory into place and write a receipt.
@@ -76,12 +77,15 @@ need them.
 
 ### Kopia deletion
 
-Podvault lists complete and incomplete snapshots by the exact project tag,
-deletes each manifest using Kopia's confirmed snapshot-deletion operation, and
-verifies that no tagged snapshot remains. It then runs full maintenance with
-Kopia's default `full` safety level. Maintenance failure is reported separately
-because the project is no longer restorable even though unreferenced physical
-blobs may remain. Shared content is never deleted directly from Azure.
+Podvault lists complete and incomplete snapshots by the exact project tag and
+can select one snapshot, all snapshots at or before an identified snapshot, all
+snapshots before a timestamp, or the complete project history. It deletes each
+selected manifest using Kopia's confirmed snapshot-deletion operation and
+verifies that every selected manifest disappeared while unselected snapshots
+remain. It then runs full maintenance with Kopia's default `full` safety level.
+Maintenance failure is reported separately because deleted history is no longer
+restorable even though unreferenced physical blobs may remain. Shared content is
+never deleted directly from Azure.
 
 ## AzCopy format
 
@@ -126,10 +130,15 @@ temporary paths. Users may override either environment variable.
 
 ### AzCopy deletion
 
-Podvault recursively removes the project's entire AzCopy prefix, verifies that
-the prefix is empty, and deletes the remote project record last. This includes
-committed generations and orphaned generations left by interrupted uploads.
-The local working directory is outside this flow and is never removed.
+For selective deletion, Podvault removes each selected immutable generation and
+verifies its prefix is empty. If the current generation is selected while an
+older generation survives, the project record is first repointed to the newest
+survivor so an interruption cannot leave a dangling current pointer. For whole
+project deletion, Podvault recursively removes the project's entire AzCopy
+prefix, verifies that the prefix is empty, and deletes the remote project record
+last. This includes committed generations and orphaned generations left by
+interrupted uploads. The local working directory is outside this flow and is
+never removed.
 
 Unlike the Kopia reconnect token, SAS authentication must appear in AzCopy's
 Azure URL and is therefore transiently visible in the AzCopy child process's

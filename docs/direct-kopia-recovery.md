@@ -59,8 +59,11 @@ empty location:
 ```bash
 kopia --config-file="$KOPIA_CONFIG_PATH" snapshot verify MANIFEST_ID
 kopia --config-file="$KOPIA_CONFIG_PATH" snapshot restore ROOT_OBJECT_ID \
-  /workspace/newlm-emergency
+  /workspace/newlm-emergency --skip-owners
 ```
+
+`--skip-owners` keeps restored files owned by the invoking account and avoids
+requiring root when the snapshot was created under another UID or GID.
 
 Do not use direct maintenance, expiration, or delete commands during an
 emergency recovery. First copy out and validate the data you need.

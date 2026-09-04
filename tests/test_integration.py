@@ -177,6 +177,7 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
         self.assertEqual(code, 0, error)
         restored = json.loads(output)
         self.assertEqual(restored["restored_summary"]["files"], 5)
+        self.assertEqual(restored["ownership_restore"], "current-user")
         self.assertEqual((destination / "file with spaces.txt").read_text(), "version two")
         self.assertFalse((destination / "excluded.tmp").exists())
         self.assertTrue((destination / "model-link").is_symlink())
@@ -192,12 +193,68 @@ class LocalRepositoryIntegrationTests(unittest.TestCase):
             self.config2,
             "delete",
             "newlm",
+            "--snapshot",
+            first["podvault_snapshot_id"],
+            "--yes",
+            "--no-maintenance",
+            json_mode=True,
+        )
+        self.assertEqual(code, 0, error)
+        deleted_old = json.loads(output)
+        self.assertEqual(deleted_old["deleted_snapshot_count"], 1)
+        self.assertEqual(deleted_old["remaining_snapshot_count"], 1)
+        self.assertFalse(deleted_old["project_deleted"])
+
+        (destination / "file with spaces.txt").write_text(
+            "version three", encoding="utf-8"
+        )
+        code, output, error = self.call(
+            self.config2,
+            "save",
+            "newlm",
+            "--description",
+            "third",
+            "--no-progress",
+            json_mode=True,
+        )
+        self.assertEqual(code, 0, error)
+        third = json.loads(output)
+
+        code, output, error = self.call(
+            self.config2,
+            "delete",
+            "newlm",
+            "--through",
+            second["podvault_snapshot_id"],
+            "--yes",
+            "--no-maintenance",
+            json_mode=True,
+        )
+        self.assertEqual(code, 0, error)
+        deleted_through = json.loads(output)
+        self.assertEqual(deleted_through["deleted_snapshot_count"], 1)
+        self.assertEqual(deleted_through["remaining_snapshot_count"], 1)
+        self.assertFalse(deleted_through["project_deleted"])
+        code, output, error = self.call(
+            self.config2, "list", "newlm", json_mode=True
+        )
+        self.assertEqual(code, 0, error)
+        remaining = json.loads(output)["snapshots"]
+        self.assertEqual(
+            [item["podvault_snapshot_id"] for item in remaining],
+            [third["podvault_snapshot_id"]],
+        )
+
+        code, output, error = self.call(
+            self.config2,
+            "delete",
+            "newlm",
             "--yes",
             json_mode=True,
         )
         self.assertEqual(code, 0, error)
         deleted = json.loads(output)
-        self.assertEqual(deleted["deleted_snapshot_count"], 2)
+        self.assertEqual(deleted["deleted_snapshot_count"], 1)
         self.assertEqual(deleted["maintenance"]["status"], "completed")
         self.assertFalse(deleted["local_directory_deleted"])
         self.assertTrue((destination / "file with spaces.txt").exists())

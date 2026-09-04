@@ -5,7 +5,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="podvault",
-    version="0.3.0",
+    version="0.4.0",
     description="Save and restore ephemeral GPU-pod projects with Kopia or AzCopy",
     long_description=(Path(__file__).parent / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",

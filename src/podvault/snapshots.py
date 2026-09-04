@@ -257,6 +257,7 @@ class SnapshotService:
             self.runner, project, include_incomplete=True
         )
         manifest_ids = [str(item.get("id") or "") for item in selected]
+        stable_ids = [str(_tag(item, "podvault.snapshot") or "") for item in selected]
         if any(not manifest_id for manifest_id in manifest_ids):
             raise VerificationError("Kopia returned a snapshot without a manifest ID")
 
@@ -269,10 +270,12 @@ class SnapshotService:
             )
 
         remaining = list_snapshots(self.runner, project, include_incomplete=True)
-        if remaining:
+        remaining_ids = {str(item.get("id") or "") for item in remaining}
+        undeleted = [manifest_id for manifest_id in manifest_ids if manifest_id in remaining_ids]
+        if undeleted:
             raise VerificationError(
-                "Kopia deletion left {} snapshot(s) for project {}".format(
-                    len(remaining), project
+                "Kopia deletion left {} selected snapshot(s) for project {}".format(
+                    len(undeleted), project
                 )
             )
 
@@ -316,6 +319,9 @@ class SnapshotService:
             "project": project,
             "deleted_snapshot_count": len(manifest_ids),
             "deleted_kopia_manifest_ids": manifest_ids,
+            "deleted_podvault_snapshot_ids": [value for value in stable_ids if value],
+            "remaining_snapshot_count": len(remaining),
+            "project_deleted": not remaining,
             "maintenance": maintenance,
         }
 

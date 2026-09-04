@@ -17,7 +17,7 @@ from podvault.browse import kopia_tree
 from podvault.catalog import ProjectCatalog
 from podvault.cli import Application, _parser
 from podvault.config import ConfigStore
-from podvault.direct import AzCopyService
+from podvault.direct import AzCopyService, select_direct_snapshot
 from podvault.errors import (
     ConfigurationError,
     CredentialError,
@@ -31,6 +31,7 @@ from podvault.paths import validate_destination, validate_relative_path, validat
 from podvault.project import canonical_source, snapshot_tags
 from podvault.receipts import ReceiptStore
 from podvault.redaction import redact
+from podvault.retention import parse_timestamp, snapshots_before, snapshots_through
 from podvault.restore import RestoreService, compare_summary, local_tree_summary
 from podvault.snapshots import SnapshotService, select_snapshot
 
@@ -232,21 +233,46 @@ class SnapshotSelectionTests(unittest.TestCase):
         self.assertEqual(select_snapshot(snapshots, "stable-old")["id"], "manifest-old")
 
 
+class RetentionSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshots = [
+            {"id": "old", "endTime": "2026-01-01T00:00:00.123456789Z"},
+            {"id": "middle", "endTime": "2026-02-01T00:00:00Z"},
+            {"id": "new", "endTime": "2026-03-01T00:00:00+00:00"},
+        ]
+
+    def test_before_is_strict_and_accepts_utc_dates(self):
+        selected = snapshots_before(self.snapshots, "2026-02-01")
+        self.assertEqual([item["id"] for item in selected], ["old"])
+
+    def test_through_is_inclusive(self):
+        selected = snapshots_through(self.snapshots, self.snapshots[1])
+        self.assertEqual([item["id"] for item in selected], ["old", "middle"])
+
+    def test_rejects_invalid_cutoff(self):
+        with self.assertRaises(ConfigurationError):
+            parse_timestamp("last Tuesday")
+
+
 class DeletingKopiaRunner:
     def __init__(self, fail_maintenance=False):
         self.snapshots = [
             {
                 "id": "manifest-one",
+                "endTime": "2026-01-01T00:00:00Z",
                 "tags": {
                     "tag:podvault.schema": "1",
                     "tag:podvault.project": "newlm",
+                    "tag:podvault.snapshot": "stable-one",
                 },
             },
             {
                 "id": "manifest-two",
+                "endTime": "2026-02-01T00:00:00Z",
                 "tags": {
                     "tag:podvault.schema": "1",
                     "tag:podvault.project": "newlm",
+                    "tag:podvault.snapshot": "stable-two",
                 },
             },
         ]
@@ -279,6 +305,23 @@ class DeletingKopiaRunner:
 
 
 class KopiaDeletionTests(unittest.TestCase):
+    def test_deletes_only_selected_snapshot_and_preserves_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = DeletingKopiaRunner()
+            service = SnapshotService(
+                runner,
+                Console(False),
+                ReceiptStore(Path(directory) / "receipts"),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = service.delete_project(
+                    "newlm", snapshots=[runner.snapshots[0]], show_progress=False
+                )
+            self.assertEqual(runner.deleted, ["manifest-one"])
+            self.assertEqual(result["deleted_podvault_snapshot_ids"], ["stable-one"])
+            self.assertEqual(result["remaining_snapshot_count"], 1)
+            self.assertFalse(result["project_deleted"])
+
     def test_deletes_all_project_snapshots_and_runs_safe_maintenance(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = DeletingKopiaRunner()
@@ -450,7 +493,7 @@ class RecordingRestoreRunner:
 
 
 class OptimizedKopiaRestoreTests(unittest.TestCase):
-    def _restore(self, durable):
+    def _restore(self, durable, preserve_owners=False):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
         runner = RecordingRestoreRunner()
@@ -468,6 +511,7 @@ class OptimizedKopiaRestoreTests(unittest.TestCase):
                 show_progress=False,
                 parallel=24,
                 durable=durable,
+                preserve_owners=preserve_owners,
             )
         return temporary, runner.restore_args, result
 
@@ -477,7 +521,10 @@ class OptimizedKopiaRestoreTests(unittest.TestCase):
             self.assertIn("--parallel=24", args)
             self.assertNotIn("--flush-files", args)
             self.assertNotIn("--write-files-atomically", args)
+            self.assertIn("--skip-owners", args)
+            self.assertIn("--no-ignore-permission-errors", args)
             self.assertEqual(result["engine"], "kopia")
+            self.assertEqual(result["ownership_restore"], "current-user")
             self.assertIn("transfer", result["timings_seconds"])
         finally:
             temporary.cleanup()
@@ -488,6 +535,16 @@ class OptimizedKopiaRestoreTests(unittest.TestCase):
             self.assertIn("--flush-files", args)
             self.assertIn("--write-files-atomically", args)
             self.assertTrue(result["durable_restore"])
+        finally:
+            temporary.cleanup()
+
+    def test_original_owners_are_an_explicit_opt_in(self):
+        temporary, args, result = self._restore(
+            durable=False, preserve_owners=True
+        )
+        try:
+            self.assertNotIn("--skip-owners", args)
+            self.assertEqual(result["ownership_restore"], "original")
         finally:
             temporary.cleanup()
 
@@ -806,6 +863,41 @@ class AzCopyServiceTests(unittest.TestCase):
                 blobs.list_blobs(".podvault/azcopy/v1/projects/newlm/")
             )
             self.assertEqual(len(runner.deletions), 1)
+
+    def test_delete_current_generation_repoints_to_newest_remaining(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            (source / "file.txt").write_text("one", encoding="utf-8")
+            blobs = MemoryBlobClient()
+            catalog = ProjectCatalog(blobs)
+            runner = FakeAzCopyRunner(source, blobs)
+            service = AzCopyService(
+                runner,
+                parse_sas_url(DELETE_SAS),
+                blobs,
+                catalog,
+                Console(False),
+                ReceiptStore(root / "receipts"),
+                ConfigStore(root / "config.json"),
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                first = service.save(source, "newlm", "one", show_progress=False)
+                (source / "file.txt").write_text("two", encoding="utf-8")
+                second = service.save(source, "newlm", "two", show_progress=False)
+                latest = select_direct_snapshot(service.list("newlm"), second["podvault_snapshot_id"])
+                result = service.delete_snapshots(
+                    "newlm", [latest], show_progress=False
+                )
+            self.assertEqual(result["deleted_generation_count"], 1)
+            self.assertEqual(result["remaining_snapshot_count"], 1)
+            self.assertFalse(result["project_deleted"])
+            self.assertEqual(
+                catalog.get("newlm")["current_snapshot"],
+                first["podvault_snapshot_id"],
+            )
+            self.assertEqual(len(service.list("newlm")), 1)
 
     def test_tree_and_selective_restore_use_only_selected_prefix(self):
         with tempfile.TemporaryDirectory() as directory:

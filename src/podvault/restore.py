@@ -97,6 +97,7 @@ class RestoreService:
         parallel: int = 32,
         durable: bool = False,
         relative_path: Optional[str] = None,
+        preserve_owners: bool = False,
     ) -> Dict[str, Any]:
         operation_started = time.monotonic()
         selected_path = validate_relative_path(relative_path)
@@ -166,6 +167,11 @@ class RestoreService:
                 "--parallel={}".format(parallel),
                 "--no-ignore-permission-errors",
             ]
+            if not preserve_owners:
+                # Project snapshots commonly move from a root-run GPU pod to
+                # an unprivileged cluster account. Preserve modes and times,
+                # but make the restored tree belong to the invoking user.
+                args.append("--skip-owners")
             if durable:
                 args.extend(["--write-files-atomically", "--flush-files"])
             if show_progress:
@@ -205,6 +211,7 @@ class RestoreService:
             "restored_summary": actual,
             "restore_parallelism": parallel,
             "durable_restore": durable,
+            "ownership_restore": "original" if preserve_owners else "current-user",
             "timings_seconds": {
                 "verification": round(verify_seconds, 3),
                 "transfer": round(transfer_seconds, 3),
